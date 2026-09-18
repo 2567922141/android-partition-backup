@@ -53,7 +53,13 @@ from partition_profiles import (
 CORE_VERSION = "1.0.0"
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
-_PART_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
+# 分区名：首字符必须是字母/数字/下划线 —— 这样 "." 与 ".." 会被直接拒绝。
+# （真实分区名如 persist / modemst1 / init_boot_a / vbmeta_system_a 都满足）
+_PART_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
+
+# 设备端路径：先做前缀白名单，再由 validate_shell_path 逐段拒绝 ".."
+_SHELL_PATH_RE = re.compile(
+    r"^/(dev/block|sdcard|data/local/tmp|data/adb)(/[A-Za-z0-9_.\-]+)*$")
 
 # 传输参数（由 Spike 实测得出：4 MiB 块 + 直接重定向最快）
 DD_BLOCK_SIZE = 4 * 1024 * 1024
@@ -222,16 +228,30 @@ class ConsoleProgress:
 
 
 def validate_partition_name(name: str) -> str:
-    """分区名白名单 —— 防命令注入的第一道也是最关键的一道防线。"""
+    """
+    分区名白名单 —— 防命令注入的第一道也是最关键的一道防线。
+
+    正则要求首字符是字母/数字/下划线，因此 "." 与 ".." 会被天然拒绝
+    （早期版本写成 [A-Za-z0-9_.\\-]{1,64}，".." 能溜过去 ——
+     虽然只是拼进 dd 的 if= 参数、不构成注入，但仍是校验缺口）。
+    """
     if not isinstance(name, str) or not _PART_NAME_RE.match(name):
         raise BackupError(f"非法分区名: {name!r}")
     return name
 
 
 def validate_shell_path(path: str) -> str:
-    """设备端路径白名单 —— 只允许 /dev/block、/sdcard、/data/local/tmp 下。"""
-    if not re.match(r"^/(dev/block|sdcard|data/local/tmp|data/adb)[/A-Za-z0-9_.\-]*$", path):
+    """
+    设备端路径白名单 —— 只允许 /dev/block、/sdcard、/data/local/tmp、/data/adb。
+
+    ⚠️ 光靠正则的字符类挡不住路径回溯：`..` 里的点也在允许字符集内，
+        `/dev/block/../../etc/passwd` 能通过前缀白名单。
+        所以必须再逐段检查一次 `..`。
+    """
+    if not isinstance(path, str) or not _SHELL_PATH_RE.match(path):
         raise BackupError(f"非法设备路径: {path!r}")
+    if ".." in path.split("/"):
+        raise BackupError(f"设备路径不得包含 .. : {path!r}")
     return path
 
 
