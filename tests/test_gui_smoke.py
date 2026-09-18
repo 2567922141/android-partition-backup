@@ -127,11 +127,19 @@ def main():
         app.name_var.set("")
         app._preview_path()
         prev_empty = app.lbl_preview.cget("text")
-        # 用「当前实际连接设备的代号」判断，不要写死某个机型 ——
-        # 否则换一台手机跑这个测试就会误报失败。
+        # 用「当前实际连接设备的代号」判断，不写死机型 —— 换台手机也不会误报
         code = (app.info.codename if app.info else "") or ""
-        check("留空时预览不含机型代号",
-              (not code) or (code not in prev_empty), prev_empty[:70])
+        # 标签格式是「路径  ⟵  说明文字」，中间用 ⟵ 分隔。
+        #
+        # ⚠️ 断言只能针对【路径部分】。说明文字里本来就会提到设备代号，
+        #    例如「检测到同一台设备（vermeer）已用此名称备份过 → 追加日期」——
+        #    那是解释为什么改名，不是把机型写进目录名。
+        #    早先的写法直接对整条标签断言，导致只要 Backups\ 下已存在同名目录
+        #    就必然失败（测试结果取决于上一次跑没跑过），是个 flaky 测试。
+        path_part = prev_empty.split("⟵")[0].strip()
+        check("留空时预览用默认名 Backup，且路径部分不含机型代号",
+              path_part.endswith("Backup") and ((not code) or (code not in path_part)),
+              path_part)
         app.name_var.set("我的备份")
         app._preview_path()
         prev_named = app.lbl_preview.cget("text")
