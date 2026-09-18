@@ -5,10 +5,10 @@
 ================================================================================
   产出两个 zip，覆盖「目标电脑有没有 Python」两种情况：
 
-     ① 安卓分区备份工具_完整便携版_v1.1.0.zip
+     ① android-partition-backup-v1.1.0-portable.zip
         含 Python 运行时 + ADB。任何 Windows 10/11 x64 解压即用，零依赖。
 
-     ② 安卓分区备份工具_脚本版_v1.1.0.zip
+     ② android-partition-backup-v1.1.0-script.zip
         只有 .py + ADB。适合本机已装 Python 的场景，体积小一个数量级。
 
   用法： powershell -ExecutionPolicy Bypass -File _build_release.ps1
@@ -22,7 +22,7 @@ $ToolDir = $Here
 # 兼容两种布局：脚本与源码同目录（开发目录），或脚本在 tools/ 下（仓库布局）
 $ToolDir = if ((Split-Path $Here -Leaf) -eq "tools") { Split-Path $Here -Parent } else { $Here }
 $WsRoot  = Split-Path $ToolDir -Parent
-$PortDir = Join-Path $WsRoot "安卓分区备份工具_便携版"      # 已构建好的便携版
+$PortDir = Join-Path $WsRoot "android-partition-backup-portable"      # 已构建好的便携版
 $RelDir  = Join-Path $WsRoot "发布包"
 $Ver     = "1.1.0"
 
@@ -221,14 +221,14 @@ function New-Zip($src, $dst, $tmpName) {
 
 Say ""
 Say "[2/3] 压缩脚本版 ..." Cyan
-$zipScript = Join-Path $RelDir "安卓分区备份工具_脚本版_v$Ver.zip"
+$zipScript = Join-Path $RelDir "android-partition-backup-v$Ver-script.zip"
 $sz1 = New-Zip $ScriptPkg $zipScript
 Say ("      {0}  ({1} MB)" -f (Split-Path $zipScript -Leaf), $sz1) Green
 Remove-Item $ScriptPkg -Recurse -Force -EA SilentlyContinue
 
 Say ""
 Say "[3/3] 压缩完整便携版（47 MB，需要一点时间）..." Cyan
-$zipFull = Join-Path $RelDir "安卓分区备份工具_完整便携版_v$Ver.zip"
+$zipFull = Join-Path $RelDir "android-partition-backup-v$Ver-portable.zip"
 $sz2 = New-Zip $PortDir $zipFull
 Say ("      {0}  ({1} MB)" -f (Split-Path $zipFull -Leaf), $sz2) Green
 
@@ -312,13 +312,13 @@ $pick = @"
 安卓分区备份工具 v$Ver — 该用哪个？
 ================================================================================
 
-【完整便携版】  安卓分区备份工具_完整便携版_v$Ver.zip
+【完整便携版】  android-partition-backup-v$Ver-portable.zip
     自带 Python 运行时(3.14.7 + Tcl/Tk 9.0) 与 ADB。
     目标电脑【不需要装任何东西】，解压 → 双击「启动备份工具.bat」即可。
     适合：给别人用 / 装到 U 盘随身带 / 电脑上没有 Python。
     要求：Windows 10 或 11，64 位。
 
-【脚本版】      安卓分区备份工具_脚本版_v$Ver.zip
+【脚本版】      android-partition-backup-v$Ver-script.zip
     只有 .py 源码 + ADB，【需要目标电脑已装 Python 3.8+】。
     体积小 5 倍，且跨平台 —— 附了 run.sh，Linux / macOS 也能跑。
     适合：自己的电脑已经装了 Python / 想改代码 / 想省空间。
@@ -342,7 +342,7 @@ $pick = @"
 
     同一台设备同名再备份会自动加日期，绝不会覆盖已有备份。
 "@
-[System.IO.File]::WriteAllText((Join-Path $RelDir "选哪个版本.txt"), $pick,
+[System.IO.File]::WriteAllText((Join-Path $RelDir "WHICH-VERSION.txt"), $pick,
                                (New-Object System.Text.UTF8Encoding $true))
 
 Say ""

@@ -22,7 +22,7 @@ $ToolDir = $Here
 # 兼容两种布局：脚本与源码同目录（开发目录），或脚本在 tools/ 下（仓库布局）
 $ToolDir = if ((Split-Path $Here -Leaf) -eq "tools") { Split-Path $Here -Parent } else { $Here }
 $WsRoot  = Split-Path $ToolDir -Parent
-$PkgRoot = Join-Path $WsRoot "安卓分区备份工具_便携版"
+$PkgRoot = Join-Path $WsRoot "android-partition-backup-portable"
 
 $PyHome  = "C:\Python314"
 $AdbSrc  = Join-Path $WsRoot "adb"
