@@ -40,7 +40,7 @@ The project was completed by DeepSeek.
 | **Performance tuning** | Compared 4 data-fetch methods × 2 write paths, chose the best combination at 14.8 MB/s | — |
 | **Coding** | Three modules, roughly 3000 lines, zero third-party dependencies | Reviewed round by round, made the calls on trade-offs |
 | **Code review** | Self-audit surfaced 4 real defects (including the classic Tkinter trap of reading variables from a worker thread) | — |
-| **Automated tests** | 4 test suites, 87 assertions in total, including a progress-bar test that specifically covers the TTY branch | — |
+| **Automated tests** | 4 test suites, 87 assertions in total, including a progress-bar test that specifically covers the TTY branch (**used for development-time regression only — not shipped with the repo**) | — |
 | **⭐ Manual testing** | Used human feedback to pinpoint root causes, fix them, and verify by regression | **A human ran the tests by hand**: walked the full GUI backup flow on a real device, and verified portable-version portability on a different computer (a VM) |
 | **On-device validation** | Compared byte-for-byte against a manual backup with sha256, 18/18 identical | Ran end-to-end on a real device and signed off on the results |
 
@@ -55,7 +55,7 @@ Then, at the **human on-device acceptance** stage, 3 more defects surfaced that 
 
 ### 🧑🔬 Testing is done by AI and humans **together**
 
-The automated tests were written by the AI (4 suites / 87 assertions), but **manual testing was not a formality — it was the main bug-catcher**.
+The automated tests were written by the AI (4 suites / 87 assertions, **development-time only — not shipped with the repo**), but **manual testing was not a formality — it was the main bug-catcher**.
 
 The 3 defects below were **not covered by a single one** of the AI's 87 assertions; every one of them was exposed by **a human testing by hand**:
 
