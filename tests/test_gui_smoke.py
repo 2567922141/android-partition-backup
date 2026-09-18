@@ -127,6 +127,9 @@ def main():
         app.name_var.set("")
         app._preview_path()
         prev_empty = app.lbl_preview.cget("text")
+        # 用「当前实际连接设备的代号」判断，不要写死某个机型 ——
+        # 否则换一台手机跑这个测试就会误报失败。
+        code = (app.info.codename if app.info else "") or ""
         check("留空时预览不含机型代号",
               (not code) or (code not in prev_empty), prev_empty[:70])
         app.name_var.set("我的备份")
