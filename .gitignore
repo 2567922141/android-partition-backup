@@ -75,9 +75,20 @@ _test_tmp/
 # ==============================================================================
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# 编辑器交换/备份文件 —— 注意：*.swp 匹配不到 .README.md.kate-swp，
+# 因为中间还有 .md。必须用 .*.kate-swp 这种"点开头 + 中间任意"的写法。
+*.swp
+*.swo
+.*.swp
+.*.swo
+*.kate-swp
+.*.kate-swp
+*~
+*.bak
+*.orig
+*.rej
+*.tmp
