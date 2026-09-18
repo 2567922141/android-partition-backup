@@ -1,6 +1,8 @@
 # Android Partition Backup
 
-[中文](README.md) | **English**
+[![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-d73a49?style=flat-square)](README.md) [![English](https://img.shields.io/badge/README-English-0969da?style=flat-square&logo=readthedocs&logoColor=white)](README.en.md)
+
+> 🌐 **This page is the English version.** Prefer Chinese? → **[Read the Chinese documentation (README.md)](README.md)**
 
 [![Vibe Coding](https://img.shields.io/badge/Vibe%20Coding-100%25-ff69b4?style=flat-square)](#-about-this-project)
 [![Made with AI](https://img.shields.io/badge/Made%20with-AI%20pair%20programming-8a2be2?style=flat-square)](#-about-this-project)

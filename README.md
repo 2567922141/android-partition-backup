@@ -1,6 +1,8 @@
 # 安卓分区备份工具 (Android Partition Backup)
 
-**中文** | [English](README.en.md)
+[![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-d73a49?style=flat-square)](README.md) [![English](https://img.shields.io/badge/README-English-0969da?style=flat-square&logo=readthedocs&logoColor=white)](README.en.md)
+
+> 🌐 **本页是中文版。** 看不惯中文？ → **[点这里阅读英文文档 README.en.md](README.en.md)**
 
 [![Vibe Coding](https://img.shields.io/badge/Vibe%20Coding-100%25-ff69b4?style=flat-square)](#-关于本项目)
 [![Made with AI](https://img.shields.io/badge/Made%20with-AI%20pair%20programming-8a2be2?style=flat-square)](#-关于本项目)
