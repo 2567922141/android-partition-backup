@@ -32,6 +32,7 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -271,6 +272,29 @@ def sha256_file(path: str, progress_cb: Optional[Callable[[int], None]] = None,
             if progress_cb:
                 progress_cb(done)
     return h.hexdigest()
+
+
+def _verify_targz(path: str) -> int:
+    """校验 tar.gz 是否完整，返回条目数。
+
+    为什么非校验不可：gzip 是流式格式，**截断的包在体积上可能看不出来**，
+    sha256 也照样算得出来 —— 唯一可靠的判据是真正解一遍。
+    tarfile 读到流末尾会抛 EOFError/ReadError，正好用来抓截断。
+
+    顺带把条目数报给用户，是个"内容合理"的旁证。
+    """
+    n = 0
+    try:
+        with tarfile.open(path, "r:gz") as tf:
+            for _ in tf:
+                n += 1
+                if n > 500000:          # 防呆：正常 /data/adb 到不了这个量级
+                    break
+    except Exception as e:               # tarfile 的异常类型较杂，统一包成 BackupError
+        raise BackupError(f"压缩包不完整或已损坏（{type(e).__name__}: {e}）") from e
+    if n == 0:
+        raise BackupError("压缩包是空的（没有任何条目）")
+    return n
 
 
 def format_guid(b: bytes) -> str:
@@ -1431,30 +1455,133 @@ class BackupEngine:
         self._emit(phase="env", item="data_adb.tar.gz")
 
         tar = self.info.caps.tar or "tar"
+        dev_tar = f"{DEVICE_STAGE_DIR}/data_adb.tar.gz"
+
+        # ⚠️ 两条必须遵守的写法，都是踩坑换来的：
+        #
+        # 1) 不要写 `2>/dev/null; true`。
+        #    那样确实"永不报错"，但 tar 真失败时也完全看不出来 ——
+        #    界面上只剩「环境包未生成」几个字，用户和开发者都无从下手。
+        #
+        # 2) 所有选项必须排在【文件操作数之前】。
+        #    `tar -czf 归档 --exclude=X .` 这种把选项夹在归档名后面的写法，
+        #    在 GNU tar 上没问题，但 toybox/bsdtar 可能把 --exclude=X 当成
+        #    要打包的文件名而报错。写成 `tar -cz --exclude=X -f 归档 .` 最稳。
         excl = "--exclude=./tmp --exclude=*.sock"
         if self.opt.exclude_busybox:
             excl += " --exclude=./ksu/bin/busybox"
         cmd = (f"mkdir -p {DEVICE_STAGE_DIR} && cd /data/adb && "
-               f"{tar} -czf {DEVICE_STAGE_DIR}/data_adb.tar.gz {excl} . 2>/dev/null; true")
+               f"rm -f {dev_tar}; "
+               f"{tar} -cz {excl} -f {dev_tar} . 2>&1; "
+               f"echo __APB_RC=$?; "
+               f"if [ -f {dev_tar} ]; then "
+               f"echo __APB_SIZE=$(stat -c %s {dev_tar} 2>/dev/null || echo 0); "
+               f"else echo __APB_MISSING=1; fi")
         try:
-            self.adb.su(cmd, timeout=3600)
-            subprocess.run(
-                self.adb._base() + ["pull", f"{DEVICE_STAGE_DIR}/data_adb.tar.gz", dest],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                creationflags=_CREATE_NO_WINDOW, timeout=7200)
-            self.adb.su(f"rm -f {DEVICE_STAGE_DIR}/data_adb.tar.gz", timeout=30)
-
-            if os.path.exists(dest) and os.path.getsize(dest) > 0:
-                res.real_size = os.path.getsize(dest)
-                res.sha256 = sha256_file(dest, cancel=self.cancel)
-                res.ok, res.message = True, "OK"
-                self.log(f"  [OK] data_adb.tar.gz  {human_size(res.real_size)}")
-            else:
-                res.ok, res.message = False, "打包文件未生成"
-                self.log("  [X] 环境包未生成（该设备可能没有 /data/adb）")
-        except (BackupError, OSError, subprocess.TimeoutExpired) as e:
-            res.ok, res.message = False, str(e)
+            out = self.adb.su(cmd, timeout=3600)
+        except (BackupError, OSError) as e:
+            res.ok, res.message = False, f"设备端打包失败: {e}"
             self.log(f"  [X] 环境包失败: {e}")
+            return res
+
+        rc_m = re.search(r"__APB_RC=(\d+)", out)
+        size_m = re.search(r"__APB_SIZE=(\d+)", out)
+        rc_val = int(rc_m.group(1)) if rc_m else -1
+        dev_size = int(size_m.group(1)) if size_m else 0
+
+        # tar 的原始输出（去掉我们自己的标记行），失败时原样转给用户看
+        noise = [ln.strip() for ln in out.splitlines()
+                 if ln.strip() and "__APB_" not in ln]
+        detail = " | ".join(noise[-5:])[:300]
+
+        if "__APB_MISSING" in out or dev_size <= 0:
+            res.ok = False
+            res.message = (f"设备端打包未生成文件（tar 退出码 {rc_val}）"
+                           + (f"：{detail}" if detail else "，且无任何输出"))
+            self.log(f"  [X] 环境包未生成 —— tar 退出码 {rc_val}")
+            for ln in noise[-5:]:
+                self.log(f"        {ln}")
+            return res
+
+        # ---- 取回本地：暂存+pull 为主，exec-out 流式为备 ----
+        #
+        # 为什么要有备选：暂存方案的产物落在 /sdcard，而 /sdcard 是 FUSE，
+        # 文件属主由 FUSE 自己指派（实测是 u0_a261:media_rw，模式 rw-rw----）。
+        # adb pull 是以 shell(uid 2000) 身份读的 —— 既不是属主也不在组里，
+        # 能不能读全看 FUSE 当下怎么算。这条链路本质上不可靠，
+        # 所以失败时必须有一条不依赖 /sdcard 的路兜底。
+        local_size = 0
+        err_detail = ""
+
+        try:
+            p = subprocess.run(self.adb._base() + ["pull", dev_tar, dest],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=_CREATE_NO_WINDOW, timeout=7200)
+            local_size = os.path.getsize(dest) if os.path.exists(dest) else 0
+            if p.returncode != 0 or local_size == 0:
+                err_detail = ((p.stderr or b"").decode("utf-8", "replace").strip()
+                              or f"adb pull 退出码 {p.returncode}")[:300]
+                self.log(f"  [!] 暂存取回失败（{err_detail}），改用流式回传 ...")
+            elif local_size != dev_size:
+                err_detail = (f"体积不符：设备端 {dev_size}，本地 {local_size}")
+                self.log(f"  [!] {err_detail}，改用流式回传 ...")
+                local_size = 0
+        except (OSError, subprocess.TimeoutExpired) as e:
+            err_detail = str(e)[:300]
+            self.log(f"  [!] 暂存取回异常（{err_detail}），改用流式回传 ...")
+        finally:
+            try:
+                self.adb.su(f"rm -f {dev_tar}", timeout=30)
+            except AdbError:
+                pass
+
+        used = "暂存+pull"
+        if local_size == 0:
+            # 流式：tar 直接写到 stdout，经 exec-out 落到本地，不碰 /sdcard。
+            # 2>/dev/null 必须保留 —— su -c 会把 stderr 并进 stdout，
+            # 而 stdout 正是要的二进制流（tar 遇到 socket 会打
+            # "unknown file type" 警告，混进来就把包毁了）。
+            used = "exec-out 流式"
+            stream_cmd = (f"cd /data/adb && {tar} -cz {excl} . 2>/dev/null")
+            try:
+                with open(dest, "wb") as fh:
+                    sp = subprocess.run(
+                        self.adb._base() + ["exec-out", f"su -c '{stream_cmd}'"],
+                        stdout=fh, stderr=subprocess.PIPE,
+                        creationflags=_CREATE_NO_WINDOW, timeout=7200)
+                local_size = os.path.getsize(dest) if os.path.exists(dest) else 0
+                if sp.returncode != 0 or local_size == 0:
+                    serr = (sp.stderr or b"").decode("utf-8", "replace").strip()[:300]
+                    res.ok = False
+                    res.message = (f"暂存与流式两条回传路径都失败。"
+                                   f"暂存：{err_detail or '未知'}；"
+                                   f"流式：{serr or f'退出码 {sp.returncode}'}")
+                    self.log(f"  [X] 环境包两条回传路径均失败")
+                    self.log(f"        暂存：{err_detail or '未知'}")
+                    self.log(f"        流式：{serr or sp.returncode}")
+                    return res
+            except (OSError, subprocess.TimeoutExpired) as e:
+                res.ok = False
+                res.message = (f"暂存与流式两条回传路径都失败。"
+                               f"暂存：{err_detail or '未知'}；流式：{e}")
+                self.log(f"  [X] 环境包两条回传路径均失败: {e}")
+                return res
+
+        # gzip 完整性校验 —— 传输被截断时体积可能"看起来对"，sha256 也照样算得出来。
+        # 只有真正解一遍才知道包是不是完整的。
+        try:
+            members = _verify_targz(dest)
+        except BackupError as e:
+            res.ok = False
+            res.message = f"{used}取回后校验失败：{e}"
+            self.log(f"  [X] 环境包校验失败: {e}")
+            return res
+
+        res.real_size = local_size
+        res.sha256 = sha256_file(dest, cancel=self.cancel)
+        res.ok, res.message = True, "OK"
+        self.log(f"  [OK] data_adb.tar.gz  {human_size(res.real_size)}"
+                 f"  含 {members} 个条目  ({used})")
         return res
 
     # ------------------------------------------------------------------ 主流程

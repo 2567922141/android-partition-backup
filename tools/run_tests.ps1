@@ -59,6 +59,9 @@ $suites = @(
     @{ name = "进度条组件"
        path = Find-Test @("tests\test_progress.py", "_tests\test_progress.py")
        rounds = 1 }
+    @{ name = "环境包完整性校验"
+       path = Find-Test @("tests\test_env_tar.py", "_tests\test_env_tar.py")
+       rounds = 1 }
     # GUI 冒烟跑两轮 —— 第二轮必然触发 Backups\ 同名冲突分支
     @{ name = "图形界面 + 进度状态机"
        path = Find-Test @("tests\test_gui_smoke.py", "_tests\smoke_gui.py")
