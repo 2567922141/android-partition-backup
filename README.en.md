@@ -199,7 +199,7 @@ You **customise** the name in the UI (leave it blank to use the default name `Ba
 | Hang protection | A stalled transfer is aborted automatically after 120 seconds (so a hung adb cannot cause an endless wait)|
 | Cancel | Cancellable at any time; partition files already completed are kept |
 
-**No restore function is provided** — writing to a partition is the only way to brick a device; please use a manual procedure together with the instructions in `README.md`.
+**No restore function is provided** — writing to a partition is the only way to brick a device. Reference commands are written only into the `README.md` generated inside each **backup directory**; run them by hand if you ever need them.
 
 This project absolutely does not leak any personal information.
 ---
@@ -316,43 +316,7 @@ if the program is installed in a read-only location such as Program Files, it au
 
 ---
 
-## 8. Four Iron Rules for Restoring
-
-> 1. **Device-bound**: `persist` / `modemst*` / `efs` / `nvdata` and the like contain device-unique data —
->    **restoring them across devices is strictly forbidden**, as it can break the fingerprint, cause signal anomalies, or even give two phones conflicting IMEIs
-> 2. **Never restore an old value to `secdata`** — it is a one-way anti-rollback counter, and writing an old value may trip the fuse and brick the device
-> 3. **The logical sector size is not necessarily 512** — Qualcomm UFS is usually 4096.
->    Check the first line of `gpt\<disk>_layout.txt` for your own device, and compute offsets from it when running `dd` by hand
-> 4. **Keep a copy before restoring GPT** — even if the current GPT is broken, back it up first with `sgdisk --backup`
-
-### Restoring root (the most common case)
-
-```sh
-fastboot flash init_boot img\init_boot_a.img
-```
-
-### Restoring non-regenerable partitions from within the system
-
-```sh
-dd if=img\persist.img  of=/dev/block/by-name/persist  bs=1M
-dd if=img\fsg.img      of=/dev/block/by-name/fsg      bs=1M
-dd if=img\modemst1.img of=/dev/block/by-name/modemst1 bs=1M
-sync && reboot
-```
-
-### Restoring GPT
-
-```sh
-sgdisk --load-backup=gpt\sda_gpt_sgdisk.bin /dev/block/sda
-sgdisk --move-second-header /dev/block/sda
-blockdev --rereadpt /dev/block/sda
-```
-
-The `README.md` in every backup directory includes these commands together with the actual partition names of that device.
-
----
-
-## 9. Technical Architecture (for future maintainers)
+## 8. Technical Architecture (for future maintainers)
 
 ```
 backup_gui.py          the GUI (Tkinter) — display and interaction only
@@ -390,7 +354,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 ---
 
-## 10. Versions
+## 9. Versions
 
 | Item | Value |
 |---|---|
@@ -402,7 +366,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 ---
 
-## 11. License
+## 10. License
 
 This project is released under the **GNU General Public License v3.0 (GPL-3.0)**.
 
@@ -424,7 +388,7 @@ This project is released under the **GNU General Public License v3.0 (GPL-3.0)**
 
 ---
 
-## 12. Research & References
+## 11. Research & References
 
 Before writing any code I searched GitHub for comparable projects and looked up public sources for the partition lists. This section documents both.
 

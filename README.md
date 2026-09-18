@@ -194,7 +194,7 @@ python backup_core.py --adb <adb路径> --list        # 只列出设备分区与
 | 卡死保护 | 传输停滞 120 秒自动中止（防止 adb 挂住导致无限等待）|
 | 取消 | 随时可取消，已完成的分区文件保留 |
 
-**恢复功能不提供** —— 写分区是变砖的唯一途径，请用手工流程配合 `README.md` 里的说明。
+**恢复功能不提供** —— 写分区是变砖的唯一途径。参考命令只写进每次备份生成的**备份目录**里的 `README.md`，需要时自行手工执行。
 
 本项目绝对不泄露任何个人信息。
 ---
@@ -311,43 +311,7 @@ python backup_core.py --adb <adb路径> --preset critical --out <输出目录>
 
 ---
 
-## 八、恢复时的四条铁律
-
-> 1. **单机绑定**：`persist` / `modemst*` / `efs` / `nvdata` 等含设备唯一数据，
->    **严禁跨设备恢复** —— 会导致指纹失效、信号异常甚至双机 IMEI 冲突
-> 2. **`secdata` 永远不要恢复旧值** —— 它是单向防回滚计数器，写旧值可能触发熔断变砖
-> 3. **逻辑扇区不一定是 512** —— 高通 UFS 通常是 4096。
->    本机是多少看 `gpt\<盘>_layout.txt` 第一行，手工 `dd` 时按它算偏移
-> 4. **恢复 GPT 前先留底** —— 哪怕当前 GPT 是坏的，也先 `sgdisk --backup` 存一份
-
-### 恢复 root（最常见）
-
-```sh
-fastboot flash init_boot img\init_boot_a.img
-```
-
-### 系统内恢复不可再生分区
-
-```sh
-dd if=img\persist.img  of=/dev/block/by-name/persist  bs=1M
-dd if=img\fsg.img      of=/dev/block/by-name/fsg      bs=1M
-dd if=img\modemst1.img of=/dev/block/by-name/modemst1 bs=1M
-sync && reboot
-```
-
-### 恢复 GPT
-
-```sh
-sgdisk --load-backup=gpt\sda_gpt_sgdisk.bin /dev/block/sda
-sgdisk --move-second-header /dev/block/sda
-blockdev --rereadpt /dev/block/sda
-```
-
-每个备份目录的 `README.md` 里都会带上这些命令与本机的实际分区名。
-
----
-
-## 九、技术架构（给未来的维护者）
+## 八、技术架构（给未来的维护者）
 
 ```
 backup_gui.py          图形界面（Tkinter），只负责显示与交互
@@ -385,7 +349,7 @@ partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 
 ---
 
-## 十、版本
+## 九、版本
 
 | 项目 | 值 |
 |---|---|
@@ -397,7 +361,7 @@ partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 
 ---
 
-## 十一、开源协议
+## 十、开源协议
 
 本项目采用 **GNU General Public License v3.0（GPL-3.0）**。
 
@@ -419,7 +383,7 @@ partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 
 ---
 
-## 十二、调研与参考
+## 十一、调研与参考
 
 动手写代码之前，先在 GitHub 上检索了同类项目，也查了分区名单的公开来源。这一节把两件事都交代清楚。
 
