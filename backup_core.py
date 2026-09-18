@@ -1010,10 +1010,34 @@ class Adb:
             return 0
 
     def read_device_file(self, dev: str, local_path: str,
-                         offset: int, length: int) -> int:
-        """用 dd 从设备读一段字节到本地（用于 GPT 头尾）。"""
+                         offset: int, length: int) -> tuple[int, str]:
+        """
+        用 dd 从设备读一段字节【回传】到本地文件（GPT 头/尾用）。
+
+        ⚠️ 关键区别：本方法走 `exec-out`，把设备上的字节流通过 adb 管道写进
+           本地的 local_path。所以 local_path 是【本地】路径，这是对的。
+
+           绝不能换成 `self.su(f"dd if=... of={local_path}")` —— 那条命令在
+           【设备】上执行，of= 必须是设备上的路径。设备上没有 D:\\ 这种盘符，
+           必然失败。v1.1.0 里六个 LUN 的尾部 GPT 全部失败就是这个原因。
+
+        返回 (实际读到的字节数, dd 的 stderr 文本)。
+        stderr 一并返回，是因为早先这里把 stderr 直接删掉，
+        导致失败时只能看到"未生成"三个字，根本查不出原因。
+        """
         validate_shell_path(dev)
-        # 用 bs=1 + skip 保证任意偏移都能精确读取
+        # ⚠️⚠️ 命令末尾的 2>/dev/null 绝对不能去掉！⚠️⚠️
+        #
+        #   `su -c` 会把子进程的 stderr 合并进 stdout，而 stdout 正是我们要的
+        #   二进制数据流。去掉这个重定向之后，dd 的摘要文字
+        #   （"2048+0 records in / 2048+0 records out / 1048576 bytes copied"，
+        #    约 83 字符）会被直接塞进镜像里。
+        #
+        #   实测：1 MiB 的 GPT 头部会变成 1048659 字节，数据整体错位，
+        #   备份文件静默报废 —— 而且 sha256 照样能算出来，看不出任何异常。
+        #
+        #   需要报错信息时走 _dd_error()：它单独跑一次、不关心 stdout 干不干净。
+        # 用 bs=512 + skip 保证任意偏移都能精确读取（块设备上 dd 会 lseek，不会真读）
         cmd = (f"{self._caps.dd} if={dev} bs=512 skip={offset // 512} "
                f"count={length // 512} 2>/dev/null")
         err_path = local_path + ".stderr"
@@ -1029,11 +1053,57 @@ class Adb:
                     p.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     pass
+        err_text = ""
+        try:
+            with open(err_path, "rb") as f:
+                err_text = f.read().decode("utf-8", "replace").strip()
+        except OSError:
+            pass
         try:
             os.remove(err_path)
         except OSError:
             pass
-        return os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        if size != length:
+            # 读少了才有必要单独捞报错 —— 正常路径上不要多跑一次 adb
+            extra = self._dd_error(dev, offset, length)
+            if extra:
+                err_text = extra
+        return size, err_text
+
+    def _dd_error(self, dev: str, offset: int, length: int) -> str:
+        """
+        读取失败后，单独跑一次把设备端的报错捞出来。
+
+        为什么要单独一次：见 read_device_file 的说明 —— 正常读取必须
+        带 2>/dev/null 才能保证字节流干净，所以报错没法在同一个进程里拿到。
+        这次用 `of=/dev/null` 丢弃数据、只关心文字输出，脏一点无所谓。
+        """
+        try:
+            out = self.su(f"{self._caps.dd} if={dev} bs=512 "
+                          f"skip={offset // 512} count={length // 512} "
+                          f"of=/dev/null", timeout=120)
+        except (AdbError, BackupError) as e:
+            return str(e)[:300]
+        return " ".join((out or "").split())[:300]
+
+    def pull_file(self, remote: str, local_path: str,
+                  timeout: int = 180) -> bool:
+        """
+        把【设备端】文件取回本地，返回是否成功。
+
+        配套 sgdisk --backup 这类"必须在设备上生成文件"的工具使用 ——
+        它们没法像 exec-out 那样直接把字节流管道回本地。
+        """
+        try:
+            p = subprocess.run(self._base() + ["pull", remote, local_path],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               creationflags=_CREATE_NO_WINDOW, timeout=timeout)
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return (p.returncode == 0
+                and os.path.exists(local_path)
+                and os.path.getsize(local_path) > 0)
 
     def cleanup_device(self):
         """删除设备端遗留的暂存目录与临时脚本。"""
@@ -1203,40 +1273,64 @@ class BackupEngine:
 
         # --- 1) 原始前 1 MiB（保护性 MBR + 主 GPT + 分区表）---
         head = os.path.join(self.gpt_dir, f"{disk.name}_head_1M.bin")
-        self.adb.read_device_file(dev, head, 0, GPT_SLICE)
-        head_ok = os.path.exists(head) and os.path.getsize(head) > 0
+        got, err = self.adb.read_device_file(dev, head, 0, GPT_SLICE)
+        head_ok = (got == GPT_SLICE)          # 第 4 段的布局解析要用
         if head_ok:
             outs.append(self._file_result("GPT", disk.name, "head_1M", head))
         else:
-            outs.append(ItemResult(kind="GPT", name=disk.name, sub="head_1M",
-                                   ok=False, message="读取失败"))
+            outs.append(ItemResult(
+                kind="GPT", name=disk.name, sub="head_1M", ok=False,
+                message=f"只读到 {human_size(got)}，应为 {human_size(GPT_SLICE)}"
+                        + (f"；dd: {err}" if err else "")))
 
         # --- 2) 原始后 1 MiB（备份 GPT）---
-        #     偏移在 Python 里算 —— 原生 64 位，天然避开 shell 的 32 位溢出坑
+        #     ⚠️ 必须走 read_device_file —— 它用 exec-out 把字节流【回传】到本地。
+        #
+        #     绝不能写成 self.adb.su(f"dd ... of={tail}")：那条命令在【设备】上
+        #     执行，而 tail 是本地 Windows 路径（D:\...\gpt\sda_tail_1M.bin），
+        #     设备上根本不存在，必然失败。
+        #     v1.1.0 里六个 LUN 的尾部全部失败正是这个原因 —— 而且当时命令末尾
+        #     挂了 2>/dev/null，把 dd 的报错全部吞掉，界面上只显示
+        #     「尾部 GPT 未生成」，完全查不出所以然。
+        #
+        #     偏移在 Python 里算 —— 原生 64 位，天然避开 shell 的 32 位整数溢出坑。
         tail = os.path.join(self.gpt_dir, f"{disk.name}_tail_1M.bin")
         if size > 2 * GPT_SLICE:
-            skip_bytes = size - GPT_SLICE
-            skip_sectors = skip_bytes // ss
-            cmd = (f"{self._dd} if={dev} of={tail} bs={ss} "
-                   f"skip={skip_sectors} count={count} 2>/dev/null")
-            try:
-                self.adb.su(cmd, timeout=180)
-            except AdbError as e:
-                self.log(f"  [!] {disk.name} 尾部读取失败: {e}")
-        if os.path.exists(tail) and os.path.getsize(tail) > 0:
-            outs.append(self._file_result("GPT", disk.name, "tail_1M", tail))
+            got, err = self.adb.read_device_file(dev, tail,
+                                                 size - GPT_SLICE, GPT_SLICE)
+            if got == GPT_SLICE:
+                outs.append(self._file_result("GPT", disk.name, "tail_1M", tail))
+            else:
+                outs.append(ItemResult(
+                    kind="GPT", name=disk.name, sub="tail_1M", ok=False,
+                    message=f"尾部不完整：拿到 {human_size(got)}，"
+                            f"应为 {human_size(GPT_SLICE)}"
+                            + (f"；dd: {err}" if err else "")))
         else:
             outs.append(ItemResult(kind="GPT", name=disk.name, sub="tail_1M",
-                                   ok=False, message="尾部 GPT 未生成"))
+                                   ok=False, message="磁盘过小，无尾部 GPT"))
 
         # --- 3) sgdisk 结构化备份（可选，仅当设备上有 sgdisk）---
+        #     ⚠️ 与上面尾部同一个坑：sgdisk 跑在【设备】上，--backup 的目标必须是
+        #        【设备端路径】。写完再 adb pull 取回本地。
+        #        直接写本地 Windows 路径同样会失败，而且 >/dev/null 2>&1 会把
+        #        报错吞掉，只留下"未生成"三个字。
+        sg = os.path.join(self.gpt_dir, f"{disk.name}_gpt_sgdisk.bin")
         if self.info.caps.has_sgdisk:
-            sg = os.path.join(self.gpt_dir, f"{disk.name}_gpt_sgdisk.bin")
+            dev_sg = f"{DEVICE_STAGE_DIR}/{disk.name}_gpt_sgdisk.bin"
             try:
-                self.adb.su(f"sgdisk --backup={sg} {dev} >/dev/null 2>&1", timeout=120)
+                self.adb.su(f"mkdir -p {DEVICE_STAGE_DIR}", timeout=30)
+                self.adb.su(f"rm -f {dev_sg}", timeout=30)
+                self.adb.su(f"sgdisk --backup={dev_sg} {dev}", timeout=120)
+                pulled = self.adb.pull_file(dev_sg, sg)
             except AdbError:
-                pass
-            if os.path.exists(sg) and os.path.getsize(sg) > 0:
+                pulled = False
+            finally:
+                try:
+                    self.adb.su(f"rm -f {dev_sg}", timeout=30)
+                except AdbError:
+                    pass
+            if pulled:
                 outs.append(self._file_result("GPT", disk.name, "gpt_sgdisk", sg))
             else:
                 self.log(f"  [!] {disk.name} sgdisk 备份未生成（不影响原始头尾备份）")
