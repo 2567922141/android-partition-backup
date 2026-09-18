@@ -1,0 +1,32 @@
+# ==============================================================================
+#  统一换行符
+# ==============================================================================
+#  ⚠️ 这条规则是必需的，不是可选优化。
+#
+#  Windows 上 git 默认开启 core.autocrlf，会把仓库里的 LF 转成 CRLF 检出。
+#  一旦 run.sh / verify_device.sh 带上 CRLF，Linux/macOS 上的 shebang
+#  会变成 "#!/bin/sh\r"，内核找不到这个解释器路径，脚本直接报
+#  "bad interpreter: No such file or directory" —— 而且报错信息完全不提换行符，
+#  极难排查。
+#
+#  所以强制全仓库用 LF。
+# ==============================================================================
+* text=auto eol=lf
+
+# 二进制文件不做任何换行转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
+*.7z   binary
+*.img  binary
+*.bin  binary
+
+# ==============================================================================
+#  语言标注（让 GitHub 正确统计与高亮）
+# ==============================================================================
+*.py    linguist-language=Python
+*.ps1   linguist-language=PowerShell
+*.sh    linguist-language=Shell

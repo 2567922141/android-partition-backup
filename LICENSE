@@ -1,0 +1,42 @@
+MIT License
+
+Copyright (c) 2026 安卓分区备份工具 contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------------
+附加免责声明（针对本工具的特殊风险）
+
+本工具用于读取安卓设备的分区数据。备份操作本身是只读的，但【恢复】操作
+（本工具不提供，仅在生成的文档中给出参考命令）会写入设备分区，可能导致：
+
+  · 设备无法启动（变砖）
+  · IMEI / 基带丢失，失去移动网络
+  · 指纹、屏幕校准、摄像头等硬件功能异常
+  · 保修失效
+
+使用者需自行承担全部风险。特别提醒：
+
+  1. persist / modemst* / efs / nvdata 等分区含【逐台唯一】数据，
+     严禁跨设备恢复 —— 会导致指纹失效、信号异常甚至双机 IMEI 冲突。
+  2. secdata 是单向防回滚计数器，恢复旧值可能触发熔断。
+  3. 不同设备的逻辑扇区大小可能不同（512 或 4096），
+     手工 dd 前务必确认，算错偏移会彻底破坏分区表。
+
+本软件按"原样"提供，作者不对任何设备损坏或数据丢失承担责任。

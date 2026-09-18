@@ -1,0 +1,1096 @@
+# -*- coding: utf-8 -*-
+"""
+安卓分区备份工具 —— 图形界面
+================================================================================
+依赖：Python 3.8+ 标准库（tkinter）+ 同目录的 backup_core.py / partition_profiles.py
+不依赖任何第三方包。
+
+【线程模型 —— Tkinter 铁律】
+    主线程：只跑 Tk 事件循环与界面更新
+    工作线程：所有 adb 调用、文件 IO、哈希计算
+    两者之间只通过 queue.Queue 通信，主线程用 root.after() 轮询队列。
+    绝不在工作线程里碰任何 tkinter 控件 —— 否则会随机崩溃。
+================================================================================
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from datetime import datetime
+from tkinter import filedialog, messagebox, ttk
+from typing import Optional
+
+# 允许脚本以任意工作目录启动
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from backup_core import (          # noqa: E402
+    Adb, AdbError, BackupEngine, BackupError, Cancelled, DeviceInfo,
+    EngineOptions, PartitionInfo, human_size, human_duration, SpeedMeter,
+    find_previous_backup, write_manifest, write_readme, CORE_VERSION,
+    default_backup_root, resolve_backup_dir, sanitize_folder_name,
+    write_device_marker, read_device_marker, DEFAULT_BACKUP_NAME,
+)
+from partition_profiles import (   # noqa: E402
+    PRESETS, PRESET_EXCLUDE, PLATFORM_GENERIC, PROFILES_VERSION,
+    detect_platform, classify,
+)
+
+APP_TITLE = "安卓分区备份工具"
+APP_VERSION = "1.1.0"
+
+CHECK_ON = "☑"
+CHECK_OFF = "☐"
+
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+# ==============================================================================
+#  环境相关小工具
+# ==============================================================================
+
+def find_adb() -> str:
+    """
+    按优先级查找 adb.exe：
+      1) 脚本同目录 / 上一级的 adb/adb.exe
+      2) 脚本同目录直接放的 adb.exe
+      3) 系统 PATH
+      4) 常见安装位置
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = []
+    for base in (here, os.path.dirname(here), os.path.dirname(os.path.dirname(here))):
+        cands.append(os.path.join(base, "adb", "adb.exe"))
+        cands.append(os.path.join(base, "adb.exe"))
+        cands.append(os.path.join(base, "platform-tools", "adb.exe"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    from shutil import which
+    w = which("adb")
+    if w:
+        return w
+    for c in (r"C:\platform-tools\adb.exe",
+              r"C:\adb\adb.exe",
+              os.path.expanduser(r"~\platform-tools\adb.exe")):
+        if os.path.isfile(c):
+            return c
+    return ""
+
+
+def pick_font() -> str:
+    """挑一个系统里存在的中文字体，避免界面出现方块。"""
+    try:
+        import tkinter.font as tkfont
+        families = set(tkfont.families())
+    except Exception:
+        return "TkDefaultFont"
+    for f in ("Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑",
+              "PingFang SC", "Noto Sans CJK SC", "SimHei", "SimSun"):
+        if f in families:
+            return f
+    return "TkDefaultFont"
+
+
+def enable_dpi_awareness():
+    """Windows 高分屏下让文字不发虚。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+# ==============================================================================
+#  主窗口
+# ==============================================================================
+
+class BackupApp:
+
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.adb_path = find_adb()
+        self.adb: Optional[Adb] = None
+        self.info: Optional[DeviceInfo] = None
+        self.partitions: list[PartitionInfo] = []
+        self.checked: set[str] = set()
+        self.rows: dict[str, str] = {}           # 分区名 -> treeview iid
+        self._item_of: dict[str, PartitionInfo] = {}
+
+        # 线程通信
+        self.msg_q: queue.Queue = queue.Queue()
+        self.poll_stop = threading.Event()
+        self.poll_paused = threading.Event()
+        self.cancel_evt = threading.Event()
+        self.worker: Optional[threading.Thread] = None
+        self._last_devs: list = []
+        self._probing = False
+
+        self.font = pick_font()
+        self._setup_style()
+        self._build_ui()
+        self._start_poll_thread()
+        self.root.after(80, self._pump)
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ------------------------------------------------------------------ 样式
+    def _setup_style(self):
+        st = ttk.Style()
+        try:
+            st.theme_use("vista")
+        except tk.TclError:
+            try:
+                st.theme_use("clam")
+            except tk.TclError:
+                pass
+        base = (self.font, 10)
+        st.configure(".", font=base)
+        st.configure("Head.TLabel", font=(self.font, 15, "bold"))
+        st.configure("Sub.TLabel", font=(self.font, 9), foreground="#666")
+        st.configure("Ok.TLabel", foreground="#1a7f37", font=(self.font, 10, "bold"))
+        st.configure("Warn.TLabel", foreground="#b54708", font=(self.font, 10, "bold"))
+        st.configure("Err.TLabel", foreground="#b42318", font=(self.font, 10, "bold"))
+        st.configure("Big.TButton", font=(self.font, 11, "bold"), padding=(16, 8))
+        st.configure("Treeview", rowheight=24, font=(self.font, 10))
+        st.configure("Treeview.Heading", font=(self.font, 10, "bold"))
+
+    # ------------------------------------------------------------------ 布局
+    def _build_ui(self):
+        self.root.title(f"{APP_TITLE} v{APP_VERSION}")
+        self.root.geometry("1060x820")
+        self.root.minsize(900, 700)
+        self._center()
+
+        outer = ttk.Frame(self.root, padding=10)
+        outer.pack(fill="both", expand=True)
+
+        self._build_device_panel(outer)
+        self._build_partition_panel(outer)
+        self._build_option_panel(outer)
+        self._build_action_panel(outer)
+        self._build_progress_panel(outer)
+        self._build_statusbar(outer)
+
+    def _center(self):
+        self.root.update_idletasks()
+        w, h = 1060, 820
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self.root.geometry(f"{w}x{h}+{max(0,(sw-w)//2)}+{max(0,(sh-h)//2-20)}")
+
+    # ---------------------------------------------------------- ① 设备状态
+    def _build_device_panel(self, parent):
+        f = ttk.LabelFrame(parent, text=" ① 设备状态 ", padding=10)
+        f.pack(fill="x", pady=(0, 8))
+
+        row = ttk.Frame(f)
+        row.pack(fill="x")
+        self.lbl_dot = ttk.Label(row, text="●", font=(self.font, 16), foreground="#999")
+        self.lbl_dot.pack(side="left", padx=(0, 8))
+
+        col = ttk.Frame(row)
+        col.pack(side="left", fill="x", expand=True)
+        self.lbl_dev = ttk.Label(col, text="正在检测设备 ...", font=(self.font, 12, "bold"))
+        self.lbl_dev.pack(anchor="w")
+        self.lbl_devsub = ttk.Label(col, text="", style="Sub.TLabel")
+        self.lbl_devsub.pack(anchor="w")
+
+        btns = ttk.Frame(row)
+        btns.pack(side="right")
+        self.btn_refresh = ttk.Button(btns, text="刷新设备", command=self._force_refresh)
+        self.btn_refresh.pack(side="left", padx=3)
+        self.btn_root = ttk.Button(btns, text="检查 Root", command=self._probe_now)
+        self.btn_root.pack(side="left", padx=3)
+
+    # ---------------------------------------------------------- ② 分区选择
+    def _build_partition_panel(self, parent):
+        f = ttk.LabelFrame(parent, text=" ② 选择要备份的分区 ", padding=10)
+        f.pack(fill="both", expand=True, pady=(0, 8))
+
+        top = ttk.Frame(f)
+        top.pack(fill="x", pady=(0, 6))
+        ttk.Label(top, text="预设方案:").pack(side="left")
+        self.preset_var = tk.StringVar(value="critical+root")
+        for p in PRESETS:
+            ttk.Radiobutton(top, text=p.display, value=p.key, variable=self.preset_var,
+                            command=self._apply_preset).pack(side="left", padx=(8, 0))
+
+        top2 = ttk.Frame(f)
+        top2.pack(fill="x", pady=(0, 6))
+        ttk.Button(top2, text="全选", width=6,
+                   command=lambda: self._bulk("all")).pack(side="left", padx=(0, 4))
+        ttk.Button(top2, text="全不选", width=7,
+                   command=lambda: self._bulk("none")).pack(side="left", padx=(0, 4))
+        ttk.Button(top2, text="反选", width=6,
+                   command=lambda: self._bulk("invert")).pack(side="left", padx=(0, 4))
+        ttk.Button(top2, text="仅不可再生", width=11,
+                   command=lambda: self._bulk("critical")).pack(side="left", padx=(0, 12))
+
+        ttk.Label(top2, text="过滤:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self._render_rows())
+        e = ttk.Entry(top2, textvariable=self.filter_var, width=18)
+        e.pack(side="left", padx=4)
+
+        self.hide_low = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top2, text="隐藏低价值分区", variable=self.hide_low,
+                        command=self._render_rows).pack(side="left", padx=(12, 0))
+
+        ttk.Label(top2, text="（勾选/取消：点击左侧方框，或选中行按空格）",
+                  style="Sub.TLabel").pack(side="right")
+
+        # ---- 表格 ----
+        wrap = ttk.Frame(f)
+        wrap.pack(fill="both", expand=True)
+
+        cols = ("chk", "name", "size", "tier", "note")
+        self.tree = ttk.Treeview(wrap, columns=cols, show="headings",
+                                 selectmode="extended")
+        heads = [("chk", "选", 44, "center"), ("name", "分区名", 210, "w"),
+                 ("size", "大小", 100, "e"), ("tier", "级别", 100, "center"),
+                 ("note", "说明", 520, "w")]
+        for key, text, width, anchor in heads:
+            self.tree.heading(key, text=text,
+                              command=lambda k=key: self._sort_by(k))
+            self.tree.column(key, width=width, anchor=anchor,
+                             stretch=(key == "note"))
+
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        self.tree.bind("<Button-1>", self._on_tree_click)
+        self.tree.bind("<space>", self._on_space)
+        self.tree.tag_configure("t1", background="#fff4e5")
+        self.tree.tag_configure("t2", background="#eef6ff")
+        self.tree.tag_configure("t4", foreground="#999999")
+
+        self.lbl_sum = ttk.Label(f, text="已选 0 项，合计 0 B", font=(self.font, 10, "bold"))
+        self.lbl_sum.pack(anchor="w", pady=(6, 0))
+
+    # ---------------------------------------------------------- ③ 选项
+    def _build_option_panel(self, parent):
+        f = ttk.LabelFrame(parent, text=" ③ 输出位置与选项 ", padding=10)
+        f.pack(fill="x", pady=(0, 8))
+
+        # ---- 备份根目录 ----
+        r1 = ttk.Frame(f)
+        r1.pack(fill="x", pady=(0, 6))
+        ttk.Label(r1, text="备份根目录:", width=12).pack(side="left")
+        self.out_var = tk.StringVar(value=self._default_outdir())
+        self.out_var.trace_add("write", lambda *_: self._preview_path())
+        ttk.Entry(r1, textvariable=self.out_var).pack(side="left", fill="x",
+                                                      expand=True, padx=6)
+        ttk.Button(r1, text="浏览...", command=self._choose_out).pack(side="left")
+        ttk.Button(r1, text="恢复默认", width=9,
+                   command=self._reset_outdir).pack(side="left", padx=(6, 0))
+
+        # ---- 自定义备份名称 ----
+        r2 = ttk.Frame(f)
+        r2.pack(fill="x", pady=(0, 6))
+        ttk.Label(r2, text="备份名称:", width=12).pack(side="left")
+        self.name_var = tk.StringVar(value="")
+        self.name_var.trace_add("write", lambda *_: self._preview_path())
+        ttk.Entry(r2, textvariable=self.name_var).pack(side="left", fill="x",
+                                                       expand=True, padx=6)
+        ttk.Label(r2, text="留空则用默认名 Backup", style="Sub.TLabel").pack(side="left")
+
+        # ---- 最终路径实时预览 ----
+        r3 = ttk.Frame(f)
+        r3.pack(fill="x", pady=(0, 8))
+        ttk.Label(r3, text="最终路径:", width=12).pack(side="left")
+        self.lbl_preview = ttk.Label(r3, text="", style="Sub.TLabel", anchor="w")
+        self.lbl_preview.pack(side="left", fill="x", expand=True)
+
+        # ---- 开关 ----
+        r4 = ttk.Frame(f)
+        r4.pack(fill="x")
+        self.opt_gpt = tk.BooleanVar(value=True)
+        self.opt_env = tk.BooleanVar(value=False)
+        self.opt_devverify = tk.BooleanVar(value=False)
+        self.opt_fallback = tk.BooleanVar(value=True)
+
+        ttk.Checkbutton(r4, text="备份 GPT 分区表", variable=self.opt_gpt).pack(side="left")
+        ttk.Checkbutton(r4, text="打包 /data/adb 环境", variable=self.opt_env).pack(side="left", padx=(14, 0))
+        ttk.Checkbutton(r4, text="设备端二次校验（慢，最严格）",
+                        variable=self.opt_devverify).pack(side="left", padx=(14, 0))
+        ttk.Checkbutton(r4, text="失败自动回退", variable=self.opt_fallback).pack(side="left", padx=(14, 0))
+
+        self.root.after(300, self._preview_path)
+
+    # ---------------------------------------------------------- ④ 操作
+    def _build_action_panel(self, parent):
+        f = ttk.Frame(parent)
+        f.pack(fill="x", pady=(0, 8))
+        self.btn_start = ttk.Button(f, text="▶  开始备份", style="Big.TButton",
+                                    command=self._start_backup, state="disabled")
+        self.btn_start.pack(side="left")
+        self.btn_cancel = ttk.Button(f, text="✕  取消", style="Big.TButton",
+                                     command=self._cancel_backup, state="disabled")
+        self.btn_cancel.pack(side="left", padx=8)
+        self.btn_open = ttk.Button(f, text="打开输出目录", command=self._open_outdir,
+                                   state="disabled")
+        self.btn_open.pack(side="left", padx=8)
+        self.lbl_result = ttk.Label(f, text="", font=(self.font, 11, "bold"))
+        self.lbl_result.pack(side="right")
+
+    # ---------------------------------------------------------- ⑤ 进度
+    def _build_progress_panel(self, parent):
+        f = ttk.LabelFrame(parent, text=" ④ 进度与日志 ", padding=10)
+        f.pack(fill="both", expand=True)
+
+        # ---- 当前分区 ----
+        r1 = ttk.Frame(f)
+        r1.pack(fill="x")
+        self.lbl_cur = ttk.Label(r1, text="就绪", width=24, anchor="w")
+        self.lbl_cur.pack(side="left")
+        self.pb_item = ttk.Progressbar(r1, mode="determinate", maximum=100)
+        self.pb_item.pack(side="left", fill="x", expand=True, padx=8)
+        self.lbl_item_pct = ttk.Label(r1, text="", width=34, anchor="e",
+                                      font=("Consolas", 9))
+        self.lbl_item_pct.pack(side="left")
+
+        # ---- 总计 ----
+        r2 = ttk.Frame(f)
+        r2.pack(fill="x", pady=(4, 8))
+        self.lbl_all_name = ttk.Label(r2, text="总计", width=24, anchor="w")
+        self.lbl_all_name.pack(side="left")
+        self.pb_all = ttk.Progressbar(r2, mode="determinate", maximum=100)
+        self.pb_all.pack(side="left", fill="x", expand=True, padx=8)
+        self.lbl_all_pct = ttk.Label(r2, text="", width=34, anchor="e",
+                                     font=("Consolas", 9))
+        self.lbl_all_pct.pack(side="left")
+
+        # ---- 日志 ----
+        wrap = ttk.Frame(f)
+        wrap.pack(fill="both", expand=True)
+        self.log = tk.Text(wrap, height=11, wrap="none", font=("Consolas", 9),
+                           background="#1e1e1e", foreground="#d4d4d4",
+                           insertbackground="#d4d4d4", padx=6, pady=4)
+        lsb = ttk.Scrollbar(wrap, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=lsb.set, state="disabled")
+        self.log.pack(side="left", fill="both", expand=True)
+        lsb.pack(side="right", fill="y")
+
+        # 日志分级着色 —— 一眼能从瀑布里挑出失败项
+        self.log.tag_configure("head", foreground="#c586c0",
+                               font=("Consolas", 9, "bold"))
+        self.log.tag_configure("ok",   foreground="#4ec9b0")
+        self.log.tag_configure("err",  foreground="#f48771",
+                               font=("Consolas", 9, "bold"))
+        self.log.tag_configure("warn", foreground="#dcdcaa")
+        self.log.tag_configure("info", foreground="#569cd6")
+        self.log.tag_configure("dim",  foreground="#808080")
+
+    def _build_statusbar(self, parent):
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=(6, 0))
+        self.lbl_status = ttk.Label(bar, text="启动中 ...", style="Sub.TLabel")
+        self.lbl_status.pack(side="left")
+        adb_txt = self.adb_path or "未找到 adb.exe"
+        ttk.Label(bar, text=f"adb: {adb_txt}", style="Sub.TLabel").pack(side="right")
+
+    # ======================================================================
+    #  工具方法
+    # ======================================================================
+
+    def _default_outdir(self) -> str:
+        """
+        默认备份根目录 = 程序目录下的 Backups。
+
+        便携版布局是 <包根>/app/backup_gui.py，此时备份应落在 <包根>/Backups
+        而不是 <包根>/app/Backups —— 所以见到名为 app 的父目录就往上提一层。
+
+        程序目录不可写时（例如装在 Program Files）自动退回家目录，
+        避免用户第一次备份就失败。
+        """
+        here = os.path.dirname(os.path.abspath(__file__))
+        if os.path.basename(here).lower() == "app":
+            here = os.path.dirname(here)
+        return default_backup_root(here)
+
+    def _reset_outdir(self):
+        self.out_var.set(self._default_outdir())
+        self._preview_path()
+
+    def _current_name(self) -> str:
+        """取用户填写的名称；留空则用通用默认名（不含机型）。"""
+        n = self.name_var.get().strip()
+        return n if n else DEFAULT_BACKUP_NAME
+
+    def _preview_path(self):
+        """实时显示本次备份会落到哪个目录，以及为什么是这个名字。"""
+        if not hasattr(self, "lbl_preview"):
+            return
+        root = self.out_var.get().strip()
+        if not root:
+            self.lbl_preview.configure(text="（请先选择备份根目录）")
+            return
+        code = self.info.codename if self.info else ""
+        sn = self.info.serial if self.info else ""
+        try:
+            r = resolve_backup_dir(root, self._current_name(), code, sn)
+        except Exception as e:
+            self.lbl_preview.configure(text=f"（无法预览：{e}）")
+            return
+        arrow = "  ⟵  " + r.reason if r.collided else "  ⟵  该名称尚未使用"
+        self.lbl_preview.configure(text=r.path + arrow)
+
+    @staticmethod
+    def _log_level(text: str) -> str:
+        """
+        从日志文本推断级别。
+
+        刻意不改 BackupEngine 的 log_cb 签名 —— 核心层不该知道界面想怎么着色，
+        保持 core / gui 解耦。代价只是这里多几行 if。
+
+        ⚠️ 顺序很关键：**前缀标记优先于关键词启发**。
+           像 "  [!] 流式失败，回退到设备端暂存模式 ..." 这种带"失败"字样的
+           告警（回退后其实成功了），若先做关键词匹配就会被误染成红色错误。
+        """
+        t = text.lstrip()
+        # ---- 第一优先：显式前缀标记（最明确的信号）----
+        if t.startswith("====="):
+            return "head"
+        if t.startswith("[OK]"):
+            return "ok"
+        if t.startswith("[X]"):
+            return "err"
+        if t.startswith("[!]") or t.startswith("[i]"):
+            return "warn"
+        # ---- 第二优先：无标记时才退回关键词启发 ----
+        if "失败" in t or "错误" in t:
+            return "err"
+        if t.startswith("  ") or t.startswith("已保存") or t.startswith("探测到"):
+            return "dim"
+        return ""
+
+    def _log(self, text: str, tag: str = ""):
+        ts = datetime.now().strftime("%H:%M:%S")
+        if not tag:
+            tag = self._log_level(text)
+        line = f"[{ts}] {text}\n"
+        self.log.configure(state="normal")
+        if tag:
+            self.log.insert("end", line, tag)
+        else:
+            self.log.insert("end", line)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _status(self, text: str):
+        self.lbl_status.configure(text=text)
+
+    def _choose_out(self):
+        d = filedialog.askdirectory(title="选择备份根目录",
+                                    initialdir=self.out_var.get() or os.getcwd())
+        if d:
+            self.out_var.set(os.path.normpath(d))
+            self._preview_path()
+
+    def _open_outdir(self):
+        """优先打开本次备份目录；还没备份过就打开备份根目录。"""
+        d = getattr(self, "_outdir", "") or self.out_var.get()
+        if not os.path.isdir(d):
+            d = self.out_var.get()
+        if not os.path.isdir(d):
+            messagebox.showinfo(APP_TITLE, "目录还不存在，先做一次备份吧。")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(d)          # noqa: S606
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", d])
+            else:
+                subprocess.Popen(["xdg-open", d])
+        except Exception as e:
+            messagebox.showwarning(APP_TITLE, f"无法打开目录：{e}")
+
+    # ======================================================================
+    #  设备轮询线程
+    # ======================================================================
+
+    def _start_poll_thread(self):
+        t = threading.Thread(target=self._poll_loop, name="device-poll", daemon=True)
+        t.start()
+
+    def _poll_loop(self):
+        while not self.poll_stop.is_set():
+            try:
+                if not self.poll_paused.is_set() and not self._probing:
+                    devs = Adb.list_devices(self.adb_path) if self.adb_path else []
+                    if devs != self._last_devs:
+                        self._last_devs = devs
+                        self.msg_q.put(("devices", devs))
+                        if devs and devs[0][1] == "device":
+                            self._probing = True
+                            self.msg_q.put(("status", "正在读取设备信息 ..."))
+                            try:
+                                adb = Adb(self.adb_path, devs[0][0])
+                                info = adb.probe()
+                                adb.attach_caps(info.caps)
+                                parts = []
+                                platform, score = PLATFORM_GENERIC, 0
+                                if info.root_ok:
+                                    parts = adb.list_partitions()
+                                    platform, score, _ = detect_platform(
+                                        [p.name for p in parts])
+                                    adb.classify_all(parts, platform)
+                                self.msg_q.put(
+                                    ("info", (adb, info, parts, platform, score)))
+                            except Exception as e:
+                                self.msg_q.put(("log", f"读取设备信息失败: {e}"))
+                            finally:
+                                self._probing = False
+            except Exception as e:
+                self.msg_q.put(("log", f"轮询异常: {e}"))
+            time.sleep(1.5)
+
+    def _force_refresh(self):
+        self._last_devs = []
+        self.lbl_dev.configure(text="正在检测设备 ...")
+        self.lbl_dot.configure(foreground="#999")
+        self.lbl_devsub.configure(text="")
+        self._status("已请求刷新")
+
+    def _probe_now(self):
+        self._force_refresh()
+
+    # ======================================================================
+    #  消息泵（主线程）
+    # ======================================================================
+
+    def _pump(self):
+        try:
+            while True:
+                kind, payload = self.msg_q.get_nowait()
+                if kind == "devices":
+                    self._on_devices(payload)
+                elif kind == "info":
+                    self._on_info(*payload)
+                elif kind == "log":
+                    self._log(str(payload))
+                elif kind == "status":
+                    self._status(str(payload))
+                elif kind == "progress":
+                    self._on_progress(payload)
+                elif kind == "done":
+                    self._on_done(payload)
+        except queue.Empty:
+            pass
+        except Exception as e:
+            self._log(f"[界面异常] {e}")
+        self.root.after(80, self._pump)
+
+    def _on_devices(self, devs):
+        if not devs:
+            self.lbl_dot.configure(foreground="#b42318")
+            self.lbl_dev.configure(text="未检测到设备")
+            self.lbl_devsub.configure(
+                text="请确认：USB 已连接 / 已开启 USB 调试 / 手机上已点“允许” / 屏幕已解锁")
+            self.btn_start.configure(state="disabled")
+            self.adb, self.info, self.partitions = None, None, []
+            self._render_rows()
+            return
+        serial, state = devs[0]
+        if state == "device":
+            self.lbl_dot.configure(foreground="#1a7f37")
+            self.lbl_dev.configure(text=f"已连接  {serial}")
+            self.lbl_devsub.configure(text="正在读取设备信息 ...")
+        elif state == "unauthorized":
+            self.lbl_dot.configure(foreground="#b54708")
+            self.lbl_dev.configure(text=f"未授权  {serial}")
+            self.lbl_devsub.configure(text="请在手机屏幕上点击“允许 USB 调试”，然后重新插拔")
+            self.btn_start.configure(state="disabled")
+        elif state == "offline":
+            self.lbl_dot.configure(foreground="#b54708")
+            self.lbl_dev.configure(text=f"离线  {serial}")
+            self.lbl_devsub.configure(text="连接异常，建议重新插拔 USB 线")
+            self.btn_start.configure(state="disabled")
+        else:
+            self.lbl_dot.configure(foreground="#b54708")
+            self.lbl_dev.configure(text=f"{state}  {serial}")
+            self.btn_start.configure(state="disabled")
+
+    def _on_info(self, adb, info: DeviceInfo, parts: list, platform, score: int):
+        self.adb, self.info = adb, info
+
+        info.platform, info.platform_score = platform, score
+        adb.classify_all(parts, platform)
+
+        self.partitions = parts
+        sub = (f"Android {info.android} (SDK {info.sdk}) · {info.version} · "
+               f"{platform.display} · 槽位 {info.slot or '无'} · "
+               f"root {'✓ ' + info.caps.root_backend_name if info.root_ok else '✗'}")
+        if not info.root_ok:
+            self.lbl_dot.configure(foreground="#b42318")
+            self.lbl_devsub.configure(text=sub + "  ← root 不可用，无法读取分区")
+            self.btn_start.configure(state="disabled")
+            self._log("root 不可用：请在 root 管理器里给 Shell/ADB 授权后点“刷新设备”")
+        else:
+            self.lbl_dev.configure(text=f"{info.display}   ({info.serial})")
+            self.lbl_devsub.configure(text=sub)
+            self._log(f"设备就绪：{info.display} / {info.codename} / {platform.display} "
+                      f"(得分 {score})")
+            self._log(f"能力：by-name={info.caps.byname_dir}  "
+                      f"sgdisk={'有' if info.caps.has_sgdisk else '无（用内置解析器）'}  "
+                      f"root={info.caps.root_backend_name or '未知'}")
+            self._status(f"共发现 {len(parts)} 个分区")
+        self._apply_preset()
+        self._render_rows()
+
+    # ======================================================================
+    #  分区列表
+    # ======================================================================
+
+    def _apply_preset(self):
+        key = self.preset_var.get()
+        preset = next((p for p in PRESETS if p.key == key), None)
+        if preset is None or key == "custom":
+            return
+        # PRESET_EXCLUDE 里的分区（userdata / super / metadata）永不自动勾选，
+        # 避免"全选"顺手带上 226 GB 的 userdata
+        self.checked = {p.name for p in self.partitions
+                        if p.tier in preset.tiers and p.name not in PRESET_EXCLUDE}
+        if preset.include_root_baseline:
+            self.checked |= {p.name for p in self.partitions
+                             if p.tier == 2 and p.name not in PRESET_EXCLUDE}
+        self._render_rows()
+
+    def _visible(self) -> list[PartitionInfo]:
+        kw = self.filter_var.get().strip().lower()
+        out = []
+        for p in self.partitions:
+            if self.hide_low.get() and p.tier == 4:
+                continue
+            if kw and kw not in p.name.lower() and kw not in (p.reason or "").lower():
+                continue
+            out.append(p)
+        return out
+
+    def _render_rows(self):
+        self.tree.delete(*self.tree.get_children())
+        self.rows.clear()
+        self._item_of.clear()
+
+        for p in self._visible():
+            mark = CHECK_ON if p.name in self.checked else CHECK_OFF
+            tag = f"t{p.tier}" if p.tier in (1, 2, 4) else ""
+            iid = self.tree.insert("", "end", values=(
+                mark, p.name, human_size(p.size), p.label, p.reason), tags=(tag,))
+            self.rows[p.name] = iid
+            self._item_of[p.name] = p
+        self._update_sum()
+
+    def _update_sum(self):
+        chosen = [p for p in self.partitions if p.name in self.checked]
+        total = sum(p.size for p in chosen)
+        crit = sum(1 for p in chosen if p.tier == 1)
+        self.lbl_sum.configure(
+            text=f"已选 {len(chosen)} 项，合计 {human_size(total)}"
+                 f"（其中不可再生 {crit} 个）")
+        ready = bool(self.adb and self.info and self.info.root_ok
+                     and chosen and self.worker is None)
+        self.btn_start.configure(state="normal" if ready else "disabled")
+
+    # ---------------------------------------------------------- 交互
+    def _on_tree_click(self, event):
+        if self.tree.identify("region", event.x, event.y) != "cell":
+            return
+        if self.tree.identify_column(event.x) != "#1":
+            return
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self._toggle_iid(iid)
+
+    def _on_space(self, _event):
+        for iid in self.tree.selection():
+            self._toggle_iid(iid)
+        return "break"
+
+    def _toggle_iid(self, iid):
+        vals = self.tree.item(iid, "values")
+        if not vals:
+            return
+        name = vals[1]
+        if name in self.checked:
+            self.checked.discard(name)
+            self.tree.item(iid, values=(CHECK_OFF,) + tuple(vals[1:]))
+        else:
+            self.checked.add(name)
+            self.tree.item(iid, values=(CHECK_ON,) + tuple(vals[1:]))
+        self._update_sum()
+        self.preset_var.set("custom")
+
+    def _bulk(self, mode):
+        vis = self._visible()
+        if mode == "all":
+            self.checked |= {p.name for p in vis}
+        elif mode == "none":
+            self.checked -= {p.name for p in vis}
+        elif mode == "invert":
+            for p in vis:
+                if p.name in self.checked:
+                    self.checked.discard(p.name)
+                else:
+                    self.checked.add(p.name)
+        elif mode == "critical":
+            self.checked |= {p.name for p in vis if p.tier == 1}
+        if mode != "critical":
+            self.preset_var.set("custom")
+        self._render_rows()
+
+    def _sort_by(self, key):
+        rev = getattr(self, "_sort_rev", {}).get(key, False)
+        self._sort_rev = getattr(self, "_sort_rev", {})
+        self._sort_rev[key] = not rev
+        if key == "name":
+            self.partitions.sort(key=lambda p: p.name, reverse=rev)
+        elif key == "size":
+            self.partitions.sort(key=lambda p: p.size, reverse=not rev)
+        elif key == "tier":
+            self.partitions.sort(key=lambda p: (p.tier or 9), reverse=rev)
+        self._render_rows()
+
+    # ======================================================================
+    #  备份
+    # ======================================================================
+
+    def _start_backup(self):
+        if not (self.adb and self.info):
+            messagebox.showwarning(APP_TITLE, "设备未就绪")
+            return
+        chosen = [p for p in self.partitions if p.name in self.checked]
+        if not chosen:
+            messagebox.showwarning(APP_TITLE, "请至少勾选一个分区")
+            return
+
+        total = sum(p.size for p in chosen)
+
+        out_root = self.out_var.get().strip()
+        if not out_root:
+            messagebox.showwarning(APP_TITLE, "请先选择备份根目录")
+            return
+        try:
+            os.makedirs(out_root, exist_ok=True)
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, f"无法创建备份根目录：\n{out_root}\n\n{e}")
+            return
+
+        # 冲突消解：同名且同机型 → 追加日期；再冲突 → 追加时间/序号。
+        # 这一步只做只读探测，不会创建任何东西。
+        resolved = resolve_backup_dir(out_root, self._current_name(),
+                                      self.info.codename, self.info.serial)
+        outdir = resolved.path
+
+        warn = ""
+        if total > 20 * 1024 ** 3:
+            warn = "\n\n⚠️ 所选内容超过 20 GB，请确认目标磁盘空间充足。"
+        elif total > 5 * 1024 ** 3:
+            warn = "\n\n⚠️ 所选内容较大，请确认磁盘空间。"
+
+        note = (f"\n命名说明：{resolved.reason}\n" if resolved.collided
+                else "\n命名说明：该名称尚未使用，直接创建。\n")
+        if not messagebox.askokcancel(
+                APP_TITLE,
+                f"即将备份 {len(chosen)} 个分区，合计 {human_size(total)}。\n\n"
+                f"备份目录：\n{outdir}\n"
+                f"{note}\n"
+                f"本工具只做只读导出，不写入设备任何分区。{warn}"):
+            return
+
+        try:
+            os.makedirs(outdir, exist_ok=False)      # ⚠️ 绝不覆盖已有目录
+        except FileExistsError:
+            messagebox.showerror(APP_TITLE,
+                                 f"目录已存在，请换个名称：\n{outdir}")
+            return
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, f"无法创建备份目录：\n{e}")
+            return
+
+        # 立刻写下设备指纹 —— 这样即使本次备份中途失败，
+        # 下次同名备份也能正确识别出"这是同一台设备"并加日期。
+        write_device_marker(outdir, {
+            "codename": self.info.codename, "serial": self.info.serial,
+            "model": self.info.model, "brand": self.info.brand,
+            "android": self.info.android, "version": self.info.version,
+        })
+
+        self.cancel_evt.clear()
+        self.poll_paused.set()
+        self._outdir = outdir
+        self._chosen = chosen
+        self._log_lines = []
+
+        # 进度追踪状态（主线程持有，工作线程只通过消息队列喂数据）
+        self._t_start = time.time()
+        self._total_bytes = total
+        self._done_bytes = 0
+        self._cur_size = 0
+        self._meter = SpeedMeter()
+
+        self.pb_item.stop()
+        self.pb_item.configure(mode="determinate", value=0)
+        self.pb_all.configure(value=0)
+        self.lbl_item_pct.configure(text="")
+        self.lbl_all_pct.configure(text=f"0 / {human_size(total)}")
+        self.lbl_all_name.configure(text="总计 0/0 项")
+
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
+        # ⚠️ 所有 tkinter 变量必须在【主线程】读完再传给工作线程。
+        #    在工作线程里调用 BooleanVar.get() / StringVar.get() 是未定义行为，
+        #    可能导致随机死锁或崩溃 —— 这是 Tkinter 最经典的坑之一。
+        opts = EngineOptions(
+            do_gpt=self.opt_gpt.get(),
+            do_env=self.opt_env.get(),
+            verify_device_side=self.opt_devverify.get(),
+            allow_fallback=self.opt_fallback.get(),
+        )
+        out_root = self.out_var.get()
+
+        self.worker = threading.Thread(
+            target=self._backup_worker,
+            args=(chosen, outdir, opts, out_root),
+            name="backup", daemon=True)
+        self.worker.start()
+
+        self.btn_start.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
+        self.btn_open.configure(state="disabled")
+        self.lbl_result.configure(text="")
+        self._status("备份进行中 ...")
+
+    def _backup_worker(self, chosen, outdir, opts: EngineOptions, out_root: str):
+        """
+        备份工作线程。
+
+        ⚠️ 本函数运行在【非主线程】，因此：
+            · 绝不能访问任何 tkinter 控件或 Variable（所需的值已由主线程读好传入）
+            · 只能通过 self.msg_q 与主线程通信
+        """
+        def log(s):
+            self._log_lines.append(s)
+            self.msg_q.put(("log", s))
+
+        def prog(d):
+            self.msg_q.put(("progress", d))
+
+        try:
+            eng = BackupEngine(
+                self.adb, outdir, opts, self.info,
+                log_cb=log, progress_cb=prog, cancel=self.cancel_evt,
+            )
+            results = eng.run(chosen)
+            eng.cleanup_device()
+
+            platform, score, _ = detect_platform([p.name for p in self.partitions])
+            topo = self.adb.detect_topology()
+            meta = {
+                "display": self.info.display, "serial": self.info.serial,
+                "codename": self.info.codename, "version": self.info.version,
+                "android": self.info.android, "sdk": self.info.sdk,
+                "slot": self.info.slot, "stamp": datetime.now().strftime("%Y%m%d"),
+                "platform": platform.display, "platform_score": score,
+                "storage": topo.display,
+                "root": self.info.caps.root_backend_name or "已 root",
+                "first_disk": topo.disks[0].name if topo.disks else "sda",
+            }
+            write_manifest(outdir, results, meta)
+            prev = find_previous_backup(out_root, outdir, tag=self.info.tag)
+            write_readme(outdir, results, meta, prev, chosen)
+            with open(os.path.join(outdir, "backup_log.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("\n".join(self._log_lines))
+
+            self.msg_q.put(("done", {"ok": True, "results": results,
+                                     "outdir": outdir, "prev": prev}))
+        except Cancelled:
+            self.msg_q.put(("done", {"ok": False, "cancelled": True, "outdir": outdir}))
+        except Exception as e:
+            self.msg_q.put(("log", f"[严重错误] {type(e).__name__}: {e}"))
+            self.msg_q.put(("done", {"ok": False, "error": str(e), "outdir": outdir}))
+
+    def _cancel_backup(self):
+        if self.worker and self.worker.is_alive():
+            if messagebox.askyesno(APP_TITLE, "确定要取消备份吗？\n已完成的文件会保留。"):
+                self.cancel_evt.set()
+                self._status("正在取消 ...")
+                self.btn_cancel.configure(state="disabled")
+
+    def _set_indeterminate(self, label: str, detail: str):
+        """把当前项进度条切成来回滚动模式（校验/打包这类没有字节进度的阶段）。"""
+        self.lbl_cur.configure(text=label)
+        self.pb_item.stop()
+        self.pb_item.configure(mode="indeterminate")
+        self.pb_item.start(14)
+        self.lbl_item_pct.configure(text=detail)
+
+    def _on_progress(self, d: dict):
+        phase = d.get("phase")
+
+        if phase == "start":
+            self._cur_size = d.get("expect", 0)
+            self.pb_item.stop()
+            self.pb_item.configure(mode="determinate", value=0)
+            self.lbl_cur.configure(text=d.get("item", ""))
+            self.lbl_item_pct.configure(
+                text=f"0 B / {human_size(self._cur_size)}")
+
+        elif phase == "item":
+            name = d.get("item", "")
+            cur = d.get("done", 0)
+            exp = d.get("expect", 0)
+            if str(self.pb_item.cget("mode")) != "determinate":
+                self.pb_item.stop()
+                self.pb_item.configure(mode="determinate")
+            self.pb_item.configure(value=(cur / exp * 100) if exp else 0)
+
+            # 速度用平滑器 —— 瞬时值会让进度条上的数字乱跳
+            spd = self._meter.sample(cur, time.time())
+            eta = self._meter.eta(cur, exp)
+            self.lbl_cur.configure(text=name)
+            self.lbl_item_pct.configure(
+                text=f"{human_size(cur)} / {human_size(exp)}   "
+                     f"{spd / 1048576:5.1f} MB/s   剩 {human_duration(eta)}")
+            self._update_overall(cur)
+
+        elif phase == "hash":
+            self._set_indeterminate(f"校验 {d.get('item','')}", "正在计算 SHA256 ...")
+
+        elif phase == "item_done":
+            self._done_bytes += self._cur_size
+            self._cur_size = 0
+            self._update_overall(0)
+            self.lbl_all_name.configure(
+                text=f"总计 {d.get('done', 0)}/{d.get('total', 1)} 项")
+
+        elif phase == "gpt":
+            self._set_indeterminate(f"GPT 分区表 {d.get('item','')}", "读取分区表 ...")
+
+        elif phase == "env":
+            self._set_indeterminate("打包 /data/adb 环境", "tar 打包中 ...")
+
+    def _update_overall(self, cur_item_done: int):
+        """刷新总体进度条、总体速度与 ETA，并把百分比同步到窗口标题。"""
+        total = getattr(self, "_total_bytes", 0)
+        if total <= 0:
+            return
+        overall = self._done_bytes + cur_item_done
+        pct = min(100.0, overall * 100.0 / total)
+        self.pb_all.configure(value=pct)
+
+        el = time.time() - getattr(self, "_t_start", time.time())
+        ospd = (overall / el) if el > 0 else 0.0
+        oeta = ((total - overall) / ospd) if ospd > 0 else None
+        self.lbl_all_pct.configure(
+            text=f"{human_size(overall)} / {human_size(total)}   "
+                 f"{ospd / 1048576:5.1f} MB/s   剩 {human_duration(oeta)}")
+        # 窗口最小化 / 被遮挡时，任务栏上也能看到进度
+        self.root.title(f"{APP_TITLE} — 备份中 {pct:.0f}%")
+
+    def _on_done(self, r: dict):
+        self.worker = None
+        self.poll_paused.clear()
+        self.btn_start.configure(state="normal")
+        self.btn_cancel.configure(state="disabled")
+        self.btn_open.configure(state="normal")
+        try:
+            self.pb_item.stop()
+            self.pb_item.configure(mode="determinate", value=100)
+        except tk.TclError:
+            pass
+
+        if r.get("cancelled"):
+            self.root.title(f"{APP_TITLE} v{APP_VERSION} — 已取消")
+        else:
+            self.pb_all.configure(value=100)
+            self.root.title(f"{APP_TITLE} v{APP_VERSION}")
+
+        if r.get("cancelled"):
+            self.lbl_result.configure(text="已取消", style="Warn.TLabel")
+            self._status("备份已取消")
+            return
+        if not r.get("ok"):
+            self.lbl_result.configure(text="失败", style="Err.TLabel")
+            self._status(f"备份失败：{r.get('error','未知错误')}")
+            messagebox.showerror(APP_TITLE, f"备份失败：\n{r.get('error','未知错误')}")
+            return
+
+        results = r["results"]
+        ok = sum(1 for x in results if x.ok)
+        bad = len(results) - ok
+        total = sum(x.real_size for x in results if x.ok)
+        if bad == 0:
+            self.lbl_result.configure(text=f"✅ 全部通过 {ok}/{len(results)}",
+                                      style="Ok.TLabel")
+        else:
+            self.lbl_result.configure(text=f"⚠️ {ok} 通过 / {bad} 失败",
+                                      style="Warn.TLabel")
+        self._status(f"完成：{ok}/{len(results)} 通过，共 {human_size(total)}")
+
+        prev = r.get("prev")
+        msg = (f"备份完成\n\n通过 {ok} / 共 {len(results)} 项\n"
+               f"总大小 {human_size(total)}\n\n输出目录：\n{r['outdir']}")
+        if prev:
+            msg += f"\n\n已与上次备份对比：\n{os.path.basename(prev)}"
+        if bad:
+            failed = [x.label for x in results if not x.ok][:10]
+            msg += f"\n\n失败项：\n" + "\n".join(failed)
+            messagebox.showwarning(APP_TITLE, msg)
+        else:
+            messagebox.showinfo(APP_TITLE, msg)
+
+    # ======================================================================
+    #  退出
+    # ======================================================================
+
+    def _on_close(self):
+        if self.worker and self.worker.is_alive():
+            if not messagebox.askyesno(APP_TITLE, "备份正在进行，确定退出吗？"):
+                return
+            self.cancel_evt.set()
+            time.sleep(0.3)
+        self.poll_stop.set()
+        self.root.destroy()
+
+
+# ==============================================================================
+#  入口
+# ==============================================================================
+
+def main():
+    enable_dpi_awareness()
+    root = tk.Tk()
+    try:
+        root.call("tk", "scaling", 1.25)
+    except tk.TclError:
+        pass
+    app = BackupApp(root)
+    if not app.adb_path:
+        root.after(300, lambda: messagebox.showerror(
+            APP_TITLE,
+            "未找到 adb.exe。\n\n"
+            "请把本工具放在包含 adb 目录的位置，\n"
+            "或把 platform-tools 加入系统 PATH 后重启本程序。"))
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
