@@ -421,3 +421,48 @@ This project is released under the **GNU General Public License v3.0 (GPL-3.0)**
 - 📝 Modified versions must state what was changed and the date
 
 **This software comes with no warranty of any kind** — see sections 15–17 of [`LICENSE`](LICENSE).
+
+---
+
+## 12. Research & References
+
+Before writing any code I searched GitHub for comparable projects and looked up public sources for the partition lists. This section documents both.
+
+### Comparable projects
+
+The survey turned up **8 related projects**, all of which I went through. The conclusion: existing solutions are **either device-side CLIs or PC command-line tools** — none offers "PC GUI + multi-select partitions + one-click backup + automatic verification".
+
+They are listed here both to document the survey and to **help you pick the right tool** — if one of them fits your use case better, just use it.
+
+| Project | Language | Form | Notes |
+|---|---|---|---|
+| [Magisk-Modules-Alt-Repo/backup](https://github.com/Magisk-Modules-Alt-Repo/backup) | Shell | Device-side CLI | Partition backup without a custom recovery; the most popular of the group |
+| [RuslanUC/pyAdbBackup](https://github.com/RuslanUC/pyAdbBackup) | Python | PC CLI | Closest in scope to this tool, but has no GUI |
+| [zzzee6/Geek_Toolbox](https://github.com/zzzee6/Geek_Toolbox) | Shell | Device-side | Partition backup/restore under KernelSU / Magisk |
+| [Skecthware/Android-Firmware-Dumper](https://github.com/Skecthware/Android-Firmware-Dumper) | — | Device-side | A/B slot detection + MD5 verification + TAR packaging |
+| [SysAdminDoc/Devicer](https://github.com/SysAdminDoc/Devicer) | C# | Windows WPF | **Has a GUI**, but Samsung-oriented and mixes many features |
+| [lopestom/android-partition-backup](https://github.com/lopestom/android-partition-backup) | Python | CLI | Plain ADB + root |
+| [Bruh938/Samsung-Partition-Backup-Tool](https://github.com/Bruh938/Samsung-Partition-Backup-Tool) | Python | CLI | Samsung only |
+| [VioletChann/cy-android-toolkit](https://github.com/VioletChann/cy-android-toolkit) | — | All-in-one toolbox | ADB / Fastboot / Magisk suite |
+
+### Where the partition tiering rules come from
+
+The tiering rules were not invented from thin air — **public sources were checked first, then verified on a real device**. The following sources directly shaped the rule tables in `partition_profiles.py`:
+
+| Source | Contribution |
+|---|---|
+| [onfix.cn, "Guide to Backing Up Phone Baseband/Firmware with Commands"](https://onfix.cn/course/4780?bid=1&mid=28642) | Qualcomm `fsg` `fsc` `modemst1` `modemst2`; MediaTek `nvram` `nvdata` `nvcfg` `persist` `protect1` `protect2` `seccfg`. The Tier 1 rules match this list **item for item** |
+| android-hilfe.de — Samsung SM-N986B (Note 20 Ultra) IMEI repair thread | The Samsung `efs` / `sec_efs` partition pair |
+| [CamsShaft/arbitrary-R-W-for-steady-and-param-partitions](https://github.com/CamsShaft/arbitrary-R-W-for-steady-and-param-partitions) | Existence of the Samsung `steady` / `param` partitions |
+
+The following entries **could not be traced to a public source**. They are kept as domain knowledge and flagged in the `partition_profiles.py` comments:
+
+> Unisoc `prodnv` `nvitem` `wcnmodem` `splloader`; Samsung `up_param`; Tensor `ldfw`
+
+Those rules **never cause a false match when the naming pattern does not apply**, but if they are wrong for your device, please open an issue.
+
+### Statement
+
+> ⚠️ **This tool does not use, copy, or adapt any code from the projects listed above.**
+> The three `.py` files total roughly 3,000 lines and are **entirely hand-written**, with **zero third-party dependencies** — you never need to `pip install` anything.
+> The projects and sources above were used **for research and for cross-checking the rules only**; the implementation, the tiering thresholds, and the inference logic are all original work.

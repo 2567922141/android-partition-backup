@@ -416,3 +416,48 @@ partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 - 📝 修改过的版本需注明改动内容与日期
 
 **本软件不提供任何担保** —— 详见 [`LICENSE`](LICENSE) 第 15–17 节。
+
+---
+
+## 十二、调研与参考
+
+动手写代码之前，先在 GitHub 上检索了同类项目，也查了分区名单的公开来源。这一节把两件事都交代清楚。
+
+### 同类项目（调研时发现）
+
+调研找到 **8 个相关项目**，全部浏览过。结论是：现存方案**要么是设备端 CLI、要么是 PC 端命令行**，没有一个提供「PC 端 GUI + 分区多选 + 一键备份 + 自动校验」。
+
+列在这里，一是交代调研过程，二是**方便你按需选型** —— 如果你的场景更适合其中某一个，直接用它就好。
+
+| 项目 | 语言 | 形态 | 特点 |
+|---|---|---|---|
+| [Magisk-Modules-Alt-Repo/backup](https://github.com/Magisk-Modules-Alt-Repo/backup) | Shell | 设备端 CLI | 无需第三方 recovery 的分区备份，同类里最主流 |
+| [RuslanUC/pyAdbBackup](https://github.com/RuslanUC/pyAdbBackup) | Python | PC 端 CLI | 定位与本工具最接近，但无图形界面 |
+| [zzzee6/Geek_Toolbox](https://github.com/zzzee6/Geek_Toolbox) | Shell | 设备端 | KernelSU / Magisk 下的分区备份与恢复 |
+| [Skecthware/Android-Firmware-Dumper](https://github.com/Skecthware/Android-Firmware-Dumper) | — | 设备端 | A/B 槽检测 + MD5 校验 + TAR 打包 |
+| [SysAdminDoc/Devicer](https://github.com/SysAdminDoc/Devicer) | C# | Windows WPF | **有 GUI**，但面向三星且功能混杂 |
+| [lopestom/android-partition-backup](https://github.com/lopestom/android-partition-backup) | Python | CLI | 纯 ADB + root |
+| [Bruh938/Samsung-Partition-Backup-Tool](https://github.com/Bruh938/Samsung-Partition-Backup-Tool) | Python | CLI | 三星专用 |
+| [VioletChann/cy-android-toolkit](https://github.com/VioletChann/cy-android-toolkit) | — | 一体工具箱 | ADB / Fastboot / Magisk 全家桶 |
+
+### 分区分级规则的来源
+
+分级规则不是凭空写的 —— **先查公开资料，再用真机验证**。以下来源直接影响了 `partition_profiles.py` 里的规则表：
+
+| 来源 | 贡献了什么 |
+|---|---|
+| [onfix.cn《手机字库基带使用命令备份指南》](https://onfix.cn/course/4780?bid=1&mid=28642) | 高通 `fsg` `fsc` `modemst1` `modemst2`；联发科 `nvram` `nvdata` `nvcfg` `persist` `protect1` `protect2` `seccfg`。Tier 1 规则与该名单**逐条一致** |
+| android-hilfe.de —— 三星 SM-N986B (Note 20 Ultra) IMEI 修复帖 | 三星 `efs` / `sec_efs` 双分区结构 |
+| [CamsShaft/arbitrary-R-W-for-steady-and-param-partitions](https://github.com/CamsShaft/arbitrary-R-W-for-steady-and-param-partitions) | 三星 `steady` / `param` 分区的存在性 |
+
+以下几项**未能找到公开来源核实**，属于领域知识保留，已在 `partition_profiles.py` 注释中标注：
+
+> 展锐 `prodnv` `nvitem` `wcnmodem` `splloader`；三星 `up_param`；Tensor `ldfw`
+
+这些规则**模式不匹配时不会误伤**，但若在你的机型上判断有误，欢迎提 Issue。
+
+### 声明
+
+> ⚠️ **本工具没有使用、复制或改写上述任何项目的代码。**
+> 三个 `.py` 文件共约 3000 行**全部手写**，**零第三方依赖** —— 你甚至不需要 `pip install` 任何东西。
+> 上述项目与来源**仅用于调研和规则核对**，具体实现、分级阈值与推断逻辑均为独立完成。
