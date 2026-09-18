@@ -4,7 +4,7 @@
 [![Made with AI](https://img.shields.io/badge/Made%20with-AI%20pair%20programming-8a2be2?style=flat-square)](#-关于本项目)
 [![Python](https://img.shields.io/badge/Python-3.8%2B%20%7C%20%E9%9B%B6%E4%BE%9D%E8%B5%96-3776ab?style=flat-square)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Android%20(arm64)-3ddc84?style=flat-square)](#)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/License-GPLv3-blue?style=flat-square)](LICENSE)
 
 **一句话**：把安卓手机里那些「丢了就再也找不回来」的分区，一键备份到电脑。
 
@@ -21,6 +21,9 @@
 项目由DeepSeek完成。
 
 ***Ai有可能犯错，仅供vibe coding学习用途，请勿用于工业生产以及其他重要行业中。若出现任何损失，后果自负！！！***
+
+> ⚠️ **使用前请务必阅读 [`DISCLAIMER.md`](DISCLAIMER.md)** —— 写分区是变砖的唯一途径，恢复操作风险极高。
+
 | 环节 | AI 做了什么 |
 |---|---|
 | **调研** | 检索 GitHub 同类项目，确认「带 GUI 的多选备份工具」是市场空白 |
@@ -367,3 +370,25 @@ partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 | 画像库版本 | 1.0.0 |
 | 依赖 | 仅 Python 标准库（tkinter），**零第三方包** |
 | 便携包体积 | 约 50 MB（含 Python 运行时 + ADB）|
+
+---
+
+## 十一、开源协议
+
+本项目采用 **GNU General Public License v3.0（GPL-3.0）**。
+
+| 项目 | 说明 |
+|---|---|
+| 许可证 | **GPL-3.0** —— 全文见 [`LICENSE`](LICENSE) |
+| SPDX 标识 | `GPL-3.0` |
+| 附加声明 | [`DISCLAIMER.md`](DISCLAIMER.md) —— 风险提示，**不修改、不替代** GPL 条款 |
+
+**你可以自由地**：使用、修改、分发本软件，**包括商业用途**。
+
+**但必须**：
+
+- 📌 保留版权声明与许可证原文
+- 🔓 **衍生作品也必须以 GPL-3.0 开源**（copyleft —— 这是 GPL 与 MIT 最大的区别）
+- 📝 修改过的版本需注明改动内容与日期
+
+**本软件不提供任何担保** —— 详见 [`LICENSE`](LICENSE) 第 15–17 节。
