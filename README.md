@@ -1,5 +1,7 @@
 # 安卓分区备份工具 (Android Partition Backup)
 
+**中文** | [English](README.en.md)
+
 [![Vibe Coding](https://img.shields.io/badge/Vibe%20Coding-100%25-ff69b4?style=flat-square)](#-关于本项目)
 [![Made with AI](https://img.shields.io/badge/Made%20with-AI%20pair%20programming-8a2be2?style=flat-square)](#-关于本项目)
 [![Python](https://img.shields.io/badge/Python-3.8%2B%20%7C%20%E9%9B%B6%E4%BE%9D%E8%B5%96-3776ab?style=flat-square)](https://www.python.org/)
