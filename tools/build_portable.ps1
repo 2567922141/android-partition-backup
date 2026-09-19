@@ -44,7 +44,7 @@ Say "  ADB     : $AdbSrc"
 Say ""
 
 # ---------------------------------------------------------------- 前置检查
-foreach ($f in @("backup_gui_qt.py", "backup_gui.py", "backup_core.py", "partition_profiles.py")) {
+foreach ($f in @("backup_gui_qt.py", "backup_gui.py", "backup_core.py", "archive_pack.py", "partition_profiles.py")) {
     if (-not (Test-Path (Join-Path $ToolDir $f))) { throw "缺少程序文件: $f" }
 }
 foreach ($f in @("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll")) {
@@ -63,7 +63,7 @@ New-Item -ItemType Directory -Force -Path $PkgRoot | Out-Null
 Say "[1/5] 复制程序本体 ..." Cyan
 $appDir = Join-Path $PkgRoot "app"
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
-foreach ($f in @("backup_gui_qt.py", "backup_gui.py", "backup_core.py", "partition_profiles.py")) {
+foreach ($f in @("backup_gui_qt.py", "backup_gui.py", "backup_core.py", "archive_pack.py", "partition_profiles.py")) {
     Copy-Item (Join-Path $ToolDir $f) $appDir -Force
     Say "      $f"
 }

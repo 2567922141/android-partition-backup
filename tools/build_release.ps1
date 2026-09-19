@@ -21,7 +21,7 @@ $Here    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ToolDir = $Here
 $WsRoot  = Split-Path (Split-Path $Here -Parent) -Parent
 $PortDir = Join-Path $WsRoot "android-partition-backup-portable"      # 已构建好的便携版
-$Ver     = "2.0.0"
+$Ver     = "2.1.0"
 $RelRoot = Join-Path $WsRoot "发布包"                                  # 各版本一个子目录
 $RelDir  = Join-Path $RelRoot "v$Ver"                                  # 本次的输出目录
 
@@ -93,7 +93,7 @@ $ScriptPkg = Join-Path $RelDir "_stage_script"
 $appDir = Join-Path $ScriptPkg "app"
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
 
-foreach ($f in @("backup_gui_qt.py", "backup_gui.py", "backup_core.py", "partition_profiles.py")) {
+foreach ($f in @("backup_gui_qt.py", "backup_gui.py", "backup_core.py", "archive_pack.py", "partition_profiles.py")) {
     Copy-Item (Join-Path $ToolDir $f) $appDir -Force
 }
 Copy-Item (Join-Path $ToolDir "README.md") $ScriptPkg -Force
@@ -320,7 +320,7 @@ print("UNZIP_OK|py=%s|Qt=%s|PySide=%s|app=%s|adb=%s" % (
     if ($SevenZip) { & $SevenZip x -o"$verifyDir\_s" -bso0 -bsp0 $zipScript | Out-Null }
     else { Expand-Archive -Path $zipScript -DestinationPath "$verifyDir\_s" -Force }
     foreach ($f in @("app\backup_gui_qt.py", "app\backup_gui.py", "app\backup_core.py",
-                     "app\partition_profiles.py", "adb\adb.exe",
+                     "app\archive_pack.py", "app\\partition_profiles.py", "adb\adb.exe",
                      "启动备份工具.bat", "使用说明.txt", "run.sh")) {
         if (-not (Test-Path (Join-Path "$verifyDir\_s" $f))) { throw "脚本版缺少 $f" }
     }

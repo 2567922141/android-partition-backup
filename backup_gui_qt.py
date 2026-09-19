@@ -55,7 +55,7 @@ APP_TITLE = "安卓分区备份工具"
 #   · backup_gui.py（Tk 版）    = 1.1.1  —— 保留作为回退方案，版本号冻结
 #   · backup_gui_qt.py（本文件）= 2.0.0  —— 界面框架从 Tk 换到 Qt6 的完整重写
 # 两者功能对等、可并存，但版本号必须区分，免得用户报障时分不清跑的是哪个。
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 # ==============================================================================
@@ -1123,6 +1123,19 @@ class BackupApp:
         self.chk_fallback.setChecked(True)
         self.opt_fallback = _BoolVar(self.chk_fallback)
         r4.add(self.chk_fallback)
+        # ==== APB_ARCHIVE BEGIN ====
+        # 备份全部跑完（含校验）之后，额外把整个备份目录压成一个 zip，
+        # 放在备份目录的**同级**、**同名**（Backups\Redmi K70\ → Backups\Redmi K70.zip），
+        # 原始文件夹原封不动地保留。打包失败不影响备份结果。
+        self.chk_archive = QCheckBox("备份完成后打包为压缩包", r4)
+        self.chk_archive.setChecked(False)   # 默认关 —— 别让每次备份都白多花时间
+        self.chk_archive.setToolTip(
+            "把整个备份目录压成一个同名的 zip，放在它的同级目录里。\n"
+            "原始文件夹原样保留，不会删除也不会移动。\n"
+            "压缩包用的是 zip（Windows 双击即可打开），打包失败不影响备份结果。")
+        self.opt_archive = _BoolVar(self.chk_archive)
+        r4.add(self.chk_archive)
+        # ==== APB_ARCHIVE END ====
 
     # ---------------------------------------------------------- ADB 服务
     def _tick_server_state(self):
@@ -1886,6 +1899,12 @@ class BackupApp:
             do_env=self.opt_env.get(),
             verify_device_side=self.opt_devverify.get(),
             allow_fallback=self.opt_fallback.get(),
+            # ==== APB_ARCHIVE BEGIN ====
+            # 勾选框的值在【主线程】读好再传进去（见上面的铁律）
+            archive_enabled=self.opt_archive.get(),
+            archive_format="zip",
+            archive_level=6,
+            # ==== APB_ARCHIVE END ====
         )
         out_root = self.out_var.get()
 
@@ -1943,8 +1962,25 @@ class BackupApp:
                       encoding="utf-8") as f:
                 f.write("\n".join(self._log_lines))
 
+            # ==== APB_ARCHIVE BEGIN ====
+            # manifest / README / backup_log 都是 run() 返回之后才写出来的，
+            # 补进已经做好的压缩包，免得解压出来少了校验清单与恢复说明。
+            # 补不进去不算失败 —— 原件都在，压缩包只是额外的一份。
+            if eng.archive.enabled and eng.archive.ok:
+                eng.archive_add_paths([
+                    os.path.join(outdir, "manifest.txt"),
+                    os.path.join(outdir, "README.md"),
+                    os.path.join(outdir, "backup_log.txt"),
+                ])
+            # ==== APB_ARCHIVE END ====
+
             self.msg_q.put(("done", {"ok": True, "results": results,
-                                     "outdir": outdir, "prev": prev}))
+                                     "outdir": outdir, "prev": prev,
+                                     # ==== APB_ARCHIVE BEGIN ====
+                                     # 打包结果一并交给主线程显示（跨线程只传数据）
+                                     "archive": eng.archive,
+                                     # ==== APB_ARCHIVE END ====
+                                     }))
         except Cancelled:
             self.msg_q.put(("done", {"ok": False, "cancelled": True, "outdir": outdir}))
         except Exception as e:
@@ -2007,6 +2043,29 @@ class BackupApp:
 
         elif phase == "env":
             self._set_indeterminate("打包 /data/adb 环境", "tar 打包中 ...")
+        # ==== APB_ARCHIVE BEGIN ====
+        elif phase == "archive_start":
+            self._set_indeterminate("打包备份产物", "准备压缩 ...")
+        elif phase == "archive":
+            # 打包阶段有真实的字节进度（引擎自己遍历目录算出来的），
+            # 所以可以用确定进度条，不必挂个忙碌指示。
+            exp = d.get("expect", 0)
+            cur = d.get("done", 0)
+            if exp > 0:
+                if self.pb_item.maximum() == 0 and self.pb_item.minimum() == 0:
+                    self.pb_item.setRange(0, 100)
+                self.pb_item.setValue(int(cur / exp * 100))
+                tf = d.get("total_files", 0)
+                extra = f"  {d.get('files', 0)}/{tf} 个文件" if tf else ""
+                self.lbl_item_pct.setText(
+                    f"{human_size(cur)} / {human_size(exp)}{extra}")
+            else:
+                self._set_indeterminate("打包备份产物", "压缩中 ...")
+            self.lbl_cur.setText("打包")
+        elif phase == "archive_done":
+            self.pb_item.setRange(0, 100)
+            self.pb_item.setValue(100 if d.get("ok") else 0)
+        # ==== APB_ARCHIVE END ====
 
     def _update_overall(self, cur_item_done: int):
         """刷新总体进度条、总体速度与 ETA，并把百分比同步到窗口标题。"""
@@ -2071,6 +2130,27 @@ class BackupApp:
         if dv_no:
             self._log(f"  [!] {dv_no} 项没能做设备端校验（设备端没算出哈希）", "warn")
 
+        # ==== APB_ARCHIVE BEGIN ====
+        # 打包环节的结果（在 run() 最后做的；没勾选时为「未启用」）
+        arc = r.get("archive")
+        arc_msg = ""
+        if arc is not None and getattr(arc, "enabled", False):
+            if arc.ok:
+                self._log(f"  [OK] 压缩包 {arc.path}", "ok")
+                self._log(f"       {arc.message}   耗时 {arc.seconds:.1f}s", "dim")
+                self._status(f"完成：{ok}/{len(results)} 通过，共 {human_size(total)}"
+                             f"，压缩包 {human_size(arc.out_bytes)}")
+                arc_msg = (f"\n\n压缩包：\n{arc.path}\n"
+                           f"{arc.message}（耗时 {arc.seconds:.1f}s）")
+            else:
+                self._log(f"  [!] 打包未完成：{arc.message}"
+                          + (f"（{arc.error}）" if arc.error else ""), "warn")
+                self._log("       备份数据完好，压缩包只是额外的一份，不影响恢复。",
+                          "warn")
+                arc_msg = (f"\n\n⚠️ 压缩包未生成：{arc.message}\n"
+                           f"备份数据完好，不影响恢复。")
+        # ==== APB_ARCHIVE END ====
+
         prev = r.get("prev")
         msg = (f"备份完成\n\n通过 {ok} / 共 {len(results)} 项\n"
                f"总大小 {human_size(total)}")
@@ -2079,6 +2159,9 @@ class BackupApp:
         if dv_no:
             msg += f"\n⚠️ {dv_no} 项未做设备端校验"
         msg += f"\n\n输出目录：\n{r['outdir']}"
+        # ==== APB_ARCHIVE BEGIN ====
+        msg += arc_msg
+        # ==== APB_ARCHIVE END ====
         if prev:
             msg += f"\n\n已与上次备份对比：\n{os.path.basename(prev)}"
         if bad:

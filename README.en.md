@@ -6,7 +6,7 @@
 
 [![Vibe Coding](https://img.shields.io/badge/Vibe%20Coding-100%25-ff69b4?style=flat-square)](#-about-this-project)
 [![Made with AI](https://img.shields.io/badge/Made%20with-AI%20pair%20programming-8a2be2?style=flat-square)](#-about-this-project)
-[![Python](https://img.shields.io/badge/Python-3.8%2B%20%7C%20%E9%9B%B6%E4%BE%9D%E8%B5%96-3776ab?style=flat-square)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.9%2B%20%7C%20PySide6-3776ab?style=flat-square)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Android%20(arm64)-3ddc84?style=flat-square)](#)
 [![License](https://img.shields.io/badge/License-GPLv3-blue?style=flat-square)](LICENSE)
 
@@ -38,8 +38,8 @@ The project was completed by DeepSeek.
 | **Research** | Searched GitHub for similar projects, confirmed that a "GUI multi-select backup tool" was a gap in the market | Set the direction of the requirements and scoped the features |
 | **Feasibility check** | Wrote a spike script to measure binary integrity of `adb exec-out` vs `adb shell` — found that the PTY corrupts 76739 bytes of 32 MB of data into `\r\n` | Provided a real device (Redmi K70) for testing |
 | **Performance tuning** | Compared 4 data-fetch methods × 2 write paths, chose the best combination at 14.8 MB/s | — |
-| **Coding** | Three modules, roughly 3000 lines, zero third-party dependencies | Reviewed round by round, made the calls on trade-offs |
-| **Code review** | Self-audit surfaced 4 real defects (including the classic Tkinter trap of reading variables from a worker thread) | — |
+| **Coding** | Four modules, roughly 7000 lines; only the GUI uses PySide6, the core engine has zero dependencies | Reviewed round by round, made the calls on trade-offs |
+| **Code review** | Self-audit surfaced 4 real defects (including the classic trap of reading GUI variables from a worker thread) | — |
 | **Automated tests** | 4 test suites, 87 assertions in total, including a progress-bar test that specifically covers the TTY branch (**used for development-time regression only — not shipped with the repo**) | — |
 | **⭐ Manual testing** | Used human feedback to pinpoint root causes, fix them, and verify by regression | **A human ran the tests by hand**: walked the full GUI backup flow on a real device, and verified portable-version portability on a different computer (a VM) |
 | **On-device validation** | Compared byte-for-byte against a manual backup with sha256, 18/18 identical | Ran end-to-end on a real device and signed off on the results |
@@ -427,6 +427,52 @@ The UI has a row: **`ADB 服务: ● 运行中  [停止]  退出本程序时会�
 > Measured (Windows / Python 3.14): after `Popen(["adb","wait-for-device"])`, letting the interpreter exit leaves that adb process **still alive**.
 > In the implementation, `backup_core.py` keeps a child-process registry: all seven `subprocess.run` calls go through `_run()` (which registers the PID), the two `Popen` sites were given registration too, and an `atexit` hook acts as a backstop — so no exit path can leave an orphan.
 
+### Optional ZIP Packaging After Backup
+
+*New in v2.1.0.*
+
+Tick **`☑ 备份完成后打包为压缩包`** in the UI (*"package the backup into a ZIP when finished"* — **off** by default), or pass `--archive` on the command line.
+
+When the backup finishes it produces **one extra** zip — **the original folder is left exactly as it is**, and the archive is **a sibling file**:
+
+```
+Backups\
+└── Redmi K70\                 ← the original backup directory, not a single byte touched
+    ├── img\
+    ├── gpt\
+    ├── manifest.txt
+    └── README.md              ← the restore notes live in this one
+Backups\
+└── Redmi K70.zip              ← the extra archive that was produced
+```
+
+| Item | Description |
+|---|---|
+| Format | **zip** (stdlib `zipfile` + `ZIP_DEFLATED`) — **zero third-party dependencies, zero external processes** |
+| Progress | Goes through the same progress events as the backup (`phase="archive"`), with real byte progress and speed |
+| Failure handling | **A packaging failure is not a backup failure** — the data itself is fine, it only raises a warning in the log |
+| Cancel | Cancellable while packing; the half-written archive is deleted and the source directory is unaffected |
+
+**Measured compression** (a real backup, 971.5 MB):
+
+| Input | Output | Saving | Time |
+|---|---|---|---|
+| 971.5 MB | **138.7 MB** | **85.7%** saved | **5.2 seconds** |
+
+> 💡 Why it squeezes so hard — partition images are **mostly zero fill** (unused blocks), and deflate barely breaks a sweat on zeros.
+> The only genuinely hard part is `data_adb.tar.gz` (already compressed), and nobody can squeeze that one further.
+
+**Why not 7z / rar**:
+
+- **rar** — WinRAR's `Rar.exe` licence **explicitly forbids redistribution alongside third-party software**, and 7-Zip **can only extract rar, never create it**. So no open-source tool can build rar compression in; that is a legal problem, not a technical one.
+- **7z** — measured on the same data: `7z -mx=9` compressed it to 30.27 MB (88.7% saved, 15 seconds), while zip compressed it to 38.40 MB (85.7% saved, **2 seconds**). **Three extra percentage points for 7.5× the time** — and it also needs `7z.exe` to happen to be on the user's machine, falling back if it is not. Not worth it.
+
+> ⚠️ **`ZIP_LZMA` is deliberately not used** — it really is smaller (close to 7z), but **Windows Explorer cannot open it**, which throws away the one thing zip had going for it: double-click and it opens.
+
+> 📌 **An easy detail to miss** — `manifest.txt` / `README.md` / `backup_log.txt` are written **after** the backup finishes (their contents depend on the result), while packing happens **inside** the backup run. Without an extra step, the unpacked backup would be **missing its checksum manifest and restore notes**. The implementation appends exactly those three files using zip's **append mode**: it rewrites only the central directory and **never re-compresses an existing entry**, so even a 971 MB archive takes milliseconds.
+
+> 📦 Module split: the packing logic lives in [`archive_pack.py`](archive_pack.py), fully decoupled from the backup engine.
+
 ## 7. FAQ
 
 ### "No device detected"
@@ -513,7 +559,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Item | Value |
 |---|---|
-| Tool version | **2.0.0** |
+| Tool version | **2.1.0** |
 | Core version | 1.0.0 |
 | Profile library version | 1.0.0 |
 | Dependencies | **PySide6** (the GUI) + the Python standard library. The core engine, `backup_core.py`, still has **zero third-party dependencies** and runs standalone from the CLI |
@@ -523,6 +569,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Version | Changes |
 |---|---|
+| **2.1.0** | **New "package the backup into a ZIP when finished"** (optional, off by default) — ticking it produces one extra zip while **the original folder is left exactly as it is**. Uses the stdlib `zipfile` + `ZIP_DEFLATED`: **zero third-party dependencies, zero external processes**; measured on a real 971.5 MB backup → **138.7 MB (85.7% saved) in 5.2 seconds**. `ZIP_LZMA` is deliberately **not** used (smaller, but Windows Explorer cannot open it). A packaging failure **is not a backup failure**. Also fixes one real defect: `manifest.txt` / `README.md` / `backup_log.txt` are written **after** the backup finishes, so unless they were added to the zip the unpacked backup would be **missing its checksum manifest and restore notes** — now appended via zip's append mode. |
 | **2.0.0** | **The GUI was migrated from Tkinter to PySide6 (Qt6)** — which finally kills the window-drag stutter at the root. Tk gives every widget its own HWND, so with 114 widgets nested 8 levels deep each resize cost 69 ms and eight Tk-side optimisations all failed; Qt measures 13.7 ms per resize, **4–5× faster**, and dragging finally keeps up with the cursor. Feature-for-feature identical to 1.1.1, with `backup_gui.py` (the Tk version) kept as a fallback. The package grew from 50 MB to 152 MB because it now bundles Qt |
 | 1.1.1 | **Device-side hashing is now on by default** — backups automatically compare against the phone's current partition via `sha256sum` (the only layer that proves the device bytes equal the disk bytes); partitions of 1 GiB or more are skipped automatically, and anything left unverified is reported honestly in the log and the dialog. **Fixed "diff against previous backup" being silently dead for partitions** (manifest lines with an empty `sub` were skipped wholesale by a `len(parts) >= 5` test, so only 18 of 45 entries were recognised). **`*_layout.txt` and `byname_mapping.txt` are now in the manifest** (they had no hash protection before). **New detailed device-info bar at the top** (system / chip / version / platform / kernel / ABI / RAM / screen / slot / patch / root, wrapping automatically in narrow windows); **ADB server switch moved to the top**; **ADB server now stops unconditionally on exit**; **fixed `adb.exe` being orphaned after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame, the limit of what Tk-side optimisation could reach); **fixed UI elements being hidden after resizing** — now a responsive layout |
 | 1.1.0 | Fixed all six LUNs' GPT tail backups failing (a local path was used as a device path); fixed the byte stream being polluted by stderr; fixed two whitelist validation gaps |
@@ -591,5 +638,7 @@ Those rules **never cause a false match when the naming pattern does not apply**
 ### Statement
 
 > ⚠️ **This tool does not use, copy, or adapt any code from the projects listed above.**
-> The three `.py` files total roughly 3,000 lines and are **entirely hand-written**, with **zero third-party dependencies** — you never need to `pip install` anything.
+> The four `.py` files total roughly 7,000 lines and are **entirely hand-written**. Only the GUI
+> (`backup_gui_qt.py`) uses PySide6; the core engine `backup_core.py` and the partition rules
+> `partition_profiles.py` have **zero third-party dependencies** and run standalone without the GUI.
 > The projects and sources above were used **for research and for cross-checking the rules only**; the implementation, the tiering thresholds, and the inference logic are all original work.

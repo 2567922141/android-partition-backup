@@ -53,6 +53,12 @@ from partition_profiles import (
     PLATFORM_GENERIC,
 )
 
+# ==== APB_ARCHIVE BEGIN ====
+# 备份完成后可选地把整个备份目录打包成一个 zip。
+# 单独成模块的原因：压缩细节（分块、取消、进度）与本模块的备份/校验逻辑
+# 毫无关系，混在一起会让这个已经「逐字节验证过」的引擎更难审。
+from archive_pack import add_to_archive, make_archive
+# ==== APB_ARCHIVE END ====
 CORE_VERSION = "1.0.0"
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
@@ -1472,6 +1478,62 @@ class EngineOptions:
     allow_fallback: bool = True
     exclude_busybox: bool = True
     skip_boot_disks: bool = True      # eMMC 的 boot0/boot1 默认不碰
+    # ==== APB_ARCHIVE BEGIN ====
+    # 备份全部跑完（含校验）之后，可选地把整个备份目录压成一个压缩包。
+    # 默认关 —— 这是一步纯附带的便利功能，默认开启会让每次备份都多花时间。
+    archive_enabled: bool = False
+    archive_format: str = "zip"       # 当前只实现 zip；见 ArchiveSummary 的说明
+    archive_level: int = 6            # zip 压缩等级 1~9
+    # ==== APB_ARCHIVE END ====
+# ==== APB_ARCHIVE BEGIN ====
+
+
+@dataclass
+class ArchiveSummary:
+    """打包环节的结果汇总 —— GUI / CLI / 日志统一从这里读。
+
+    刻意与 archive_pack.ArchiveResult 分开：
+      · ArchiveResult 描述「某一次打包调用的结果」
+      · ArchiveSummary 描述「这次备份的打包环节到底发生了什么」，
+        还要能表达「压根没开启」这种根本没调用打包的状态。
+
+    ⚠️ 它**不参与** run() 的返回值 —— run() 仍然只返回 list[ItemResult]，
+       这样既有的调用方、测试、失败计数逻辑一行都不用改。
+       打包失败绝不能把整次备份算成失败：备份数据本身是好的。
+    """
+    enabled: bool = False
+    ok: bool = False
+    path: str = ""                     # 压缩包路径（同级、同名、加扩展名）
+    fmt: str = "zip"
+    src_bytes: int = 0                 # 原始总字节
+    out_bytes: int = 0                 # 压缩后字节（失败为 0）
+    seconds: float = 0.0
+    message: str = ""                  # 成功时的一句话
+    error: str = ""                    # 失败原因（原文）
+
+    @property
+    def saved_pct(self) -> Optional[float]:
+        """省了百分之多少。没成功或原始大小为 0 时返回 None。"""
+        if not self.ok or self.src_bytes <= 0:
+            return None
+        return (1.0 - self.out_bytes / float(self.src_bytes)) * 100.0
+
+    @property
+    def display(self) -> str:
+        """一句话汇总，GUI / CLI 共用。"""
+        if not self.enabled:
+            return "未启用"
+        if self.ok:
+            return f"{self.message}   →   {self.path}"
+        return f"失败：{self.message or self.error}"
+
+    @classmethod
+    def from_result(cls, res) -> "ArchiveSummary":
+        """由 archive_pack.ArchiveResult 构造。"""
+        return cls(enabled=True, ok=bool(res.ok), path=res.path, fmt=res.fmt,
+                   src_bytes=res.src_bytes, out_bytes=res.out_bytes,
+                   seconds=res.seconds, message=res.message, error=res.error)
+# ==== APB_ARCHIVE END ====
 
 
 class BackupEngine:
@@ -1506,6 +1568,10 @@ class BackupEngine:
         self._total = 0
         self._done = 0
         self._dd = info.caps.dd or "dd"
+        # ==== APB_ARCHIVE BEGIN ====
+        # 打包环节的结果汇总。默认「未启用」，archive_enabled 为真时才被改写。
+        self.archive = ArchiveSummary()
+        # ==== APB_ARCHIVE END ====
 
     # ------------------------------------------------------------------ 内部
     def _check_cancel(self):
@@ -1950,11 +2016,159 @@ class BackupEngine:
         except (AdbError, OSError) as e:
             self.log(f"[!] by-name 映射表保存失败: {e}")
 
+        # ==== APB_ARCHIVE BEGIN ====
+        # ---- 打包（可选，追加在最后；所有分区与校验都已做完）----
+        # 失败不影响上面的结果，也不改 run() 的返回值 —— 见 ArchiveSummary 的说明。
+        if self.opt.archive_enabled:
+            try:
+                self.archive = self.archive_output()
+            except Exception as e:            # 兜底：打包绝不能让备份算失败
+                self.archive = ArchiveSummary(
+                    enabled=True, path=self.archive_output_path(),
+                    message=f"打包异常：{type(e).__name__}: {e}",
+                    error=f"{type(e).__name__}: {e}")
+                self.log(f"  [!] 打包阶段异常，已跳过: {self.archive.message}")
+        # ==== APB_ARCHIVE END ====
         self._emit(phase="finished")
         return self.results
 
     def cleanup_device(self):
         self.adb.cleanup_device()
+    # ==== APB_ARCHIVE BEGIN ====
+
+    # ------------------------------------------------------------------ 打包
+    def archive_output_path(self) -> str:
+        """压缩包该放哪 —— 备份目录的**同级**、**同名**，只加一个扩展名。
+
+            ...\\Backups\\Redmi K70\\   →   ...\\Backups\\Redmi K70.zip
+
+        刻意不放进去、也不移动原件：压缩包是**额外**的一份，原件永远原样留着。
+        """
+        src = os.path.abspath(os.path.normpath(self.outdir))
+        return os.path.join(os.path.dirname(src), os.path.basename(src) + ".zip")
+
+    def archive_output(self) -> ArchiveSummary:
+        """把整个备份目录压成一个 zip —— 追加在备份流程最后的可选一步。
+
+        【三条不可违背的约束】
+        1. 只读备份目录。绝不删除、绝不移动任何原始文件/目录。
+        2. 失败**不算**备份失败。备份数据本身是好的，这里只是少了个便利；
+           失败原因进日志 + 进 ArchiveSummary，由 GUI / CLI 如实报出来。
+        3. 走与备份阶段**同一套**进度事件（phase="archive"），GUI 才能显示。
+
+        【取消了会怎样】
+        用户按取消时不再抛 Cancelled，而是让打包停在半路、把结果记成
+        「已取消打包」。原因：此时分区镜像与校验**都已经成功完成**，
+        若抛 Cancelled，调用方（GUI 工作线程）会走取消分支直接返回，
+        连 manifest.txt / README.md / backup_log.txt 都不会再写 ——
+        为了一个附属步骤丢掉整份备份的收尾材料，明显不划算。
+        """
+        out_path = self.archive_output_path()
+        summary = ArchiveSummary(enabled=True, path=out_path)
+
+        fmt = (self.opt.archive_format or "zip").strip().lower()
+        if fmt != "zip":
+            # 只实现了 zip。这里必须说出来，否则用户以为拿到的是 7z。
+            self.log(f"  [!] 只支持 zip 打包，忽略配置里的 {fmt!r}，按 zip 处理")
+            fmt = "zip"
+        summary.fmt = fmt
+
+        level = self.opt.archive_level
+        try:
+            level = min(9, max(1, int(level)))
+        except (TypeError, ValueError):
+            level = 6
+
+        src = os.path.abspath(os.path.normpath(self.outdir))
+        name = os.path.basename(src)
+        self.log(f"===== 打包备份产物（zip, 等级 {level}）=====")
+        self.log(f"  源目录 : {src}")
+        self.log(f"  压缩包 : {out_path}")
+
+        expects = {"bytes": 0, "files": 0}
+        last_emit = {"t": 0.0}
+
+        def on_progress(done_files: int, total_files: int,
+                        done_bytes: int, total_bytes: int) -> None:
+            # 源目录里有几百个文件时，每个文件都发一次事件会把消息队列灌满，
+            # 所以按时间节流到 4 Hz；文件很少时这点延迟完全看不出来。
+            now = time.time()
+            if done_bytes < total_bytes and now - last_emit["t"] < 0.25:
+                return
+            last_emit["t"] = now
+            expects["bytes"], expects["files"] = total_bytes, total_files
+            self._emit(phase="archive", item=name + ".zip",
+                       done=done_bytes, expect=total_bytes,
+                       files=done_files, total_files=total_files)
+
+        self._emit(phase="archive_start", item=name + ".zip")
+
+        try:
+            res = make_archive(src, out_path, level=level,
+                               progress_cb=on_progress,
+                               cancel_check=self.cancel.is_set)
+        except Exception as e:                    # make_archive 承诺不抛，这里只是兜底
+            summary.message = f"打包异常：{type(e).__name__}: {e}"
+            summary.error = f"{type(e).__name__}: {e}"
+            # 同样用 [!] 告警前缀：备份本身是成功的，别让用户看到红色就慌
+            self.log(f"  [!] 打包阶段异常，已跳过: {summary.message}")
+            self.log(f"      备份数据本身完好，压缩包只是额外的一份，不影响恢复。")
+            self._emit(phase="archive_done", item=name + ".zip", ok=False,
+                       message=summary.message,
+                       path=out_path)
+            return summary
+
+        summary.ok = bool(res.ok)
+        summary.src_bytes = int(res.src_bytes or 0)
+        summary.out_bytes = int(res.out_bytes or 0)
+        summary.seconds = float(res.seconds or 0)
+        summary.message = res.message or ""
+        summary.error = res.error or ""
+
+        if res.ok:
+            self.log(f"  [OK] {os.path.basename(out_path)}  "
+                     f"{summary.message}  {summary.seconds:.1f}s")
+        else:
+            # 只是告警，不是备份失败 —— 前缀用 [!] 而不是 [X]，
+            # 免得用户在日志里看到红色就以为备份坏了。
+            self.log(f"  [!] 打包未完成: {res.message}"
+                     + (f"（{res.error}）" if res.error else ""))
+            self.log(f"      备份数据本身完好，压缩包只是额外的一份，不影响恢复。")
+        if res.path and res.path != out_path:
+            self.log(f"  [i] 实际输出路径: {res.path}")
+
+        self._emit(phase="archive_done", item=name + ".zip",
+                   ok=summary.ok, message=summary.display,
+                   path=out_path, out_bytes=summary.out_bytes,
+                   src_bytes=summary.src_bytes)
+        return summary
+
+    def archive_add_paths(self, paths: list) -> tuple[bool, str]:
+        """把 run() 返回之后才写出来的文件补进已经做好的压缩包里。
+
+        调用时机：调用方写完 manifest.txt / README.md / backup_log.txt 之后。
+        （这些文件的内容依赖 run() 的结果，所以不可能赶在打包之前写。）
+
+        未开启打包、或打包没成功时，本方法什么都不做。
+        返回 (是否成功, 说明文字) —— 失败同样不影响备份结果。
+        """
+        if not (self.archive.enabled and self.archive.ok and self.archive.path):
+            return False, "未启用打包或打包未成功"
+        src = os.path.abspath(os.path.normpath(self.outdir))
+        name = os.path.basename(src)
+        items = []
+        for p in paths:
+            if isinstance(p, (tuple, list)) and len(p) == 2:
+                local, arc = p
+            else:
+                local, arc = p, f"{name}/{os.path.basename(p)}"
+            items.append((local, arc))
+        ok, msg = add_to_archive(self.archive.path, items)
+        if not ok:
+            self.log(f"  [!] 报告文件未能补进压缩包: {msg}")
+        return ok, msg
+
+    # ==== APB_ARCHIVE END ====
 
 
 # ==============================================================================
@@ -2425,6 +2639,12 @@ def _cli():
                     action="store_false", default=True,
                     help="关掉设备端二次校验（默认开启）")
     ap.add_argument("--quiet", action="store_true", help="不显示实时进度条")
+    # ==== APB_ARCHIVE BEGIN ====
+    ap.add_argument("--archive", action="store_true",
+                    help="备份完成后把整个备份目录打包成一个 zip（默认关）")
+    ap.add_argument("--archive-level", type=int, default=6, metavar="N",
+                    help="zip 压缩等级 1~9（默认 6）")
+    # ==== APB_ARCHIVE END ====
     ap.add_argument("--list", action="store_true", help="列出设备/分区/分级后退出")
     args = ap.parse_args()
 
@@ -2551,12 +2771,26 @@ def _cli():
             # hash / gpt / env / finished —— 这些阶段没有字节级进度，收掉进度行即可
             bar.finish()
 
+        # ==== APB_ARCHIVE BEGIN ====
+        if phase == "archive":
+            # 打包阶段有真实的字节进度，可以画条真进度条（不是忙碌指示）
+            cur = d.get("done", 0)
+            exp = d.get("expect", 0)
+            spd = meter.sample(cur, time.time())
+            bar.update(d.get("item", "打包"), cur, exp, spd, meter.eta(cur, exp))
+        # ==== APB_ARCHIVE END ====
     eng = BackupEngine(
         adb, outdir,
         EngineOptions(do_gpt=not args.no_gpt, do_env=args.env,
                       verify_device_side=args.verify_device),
         info, log_cb=log, progress_cb=prog,
     )
+    # ==== APB_ARCHIVE BEGIN ====
+    # 打包开关在构造之后补写 —— 这样上面那段 EngineOptions 的构造一行都不用动。
+    eng.opt.archive_enabled = args.archive
+    eng.opt.archive_format = "zip"
+    eng.opt.archive_level = args.archive_level
+    # ==== APB_ARCHIVE END ====
     results = eng.run(chosen)
     eng.cleanup_device()
     bar.finish()
@@ -2575,8 +2809,29 @@ def _cli():
     with open(os.path.join(outdir, "backup_log.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(log_lines))
 
+    # ==== APB_ARCHIVE BEGIN ====
+    # 上面三份报告是 run() 之后才写的，补进压缩包，免得解压出来少了
+    # 校验清单与恢复说明（README.md 里正是恢复要点）。补不进去不算失败。
+    if eng.archive.enabled and eng.archive.ok:
+        eng.archive_add_paths([
+            os.path.join(outdir, "manifest.txt"),
+            os.path.join(outdir, "README.md"),
+            os.path.join(outdir, "backup_log.txt"),
+        ])
+    # ==== APB_ARCHIVE END ====
     ok = sum(1 for r in results if r.ok)
     print(f"\n完成：{ok}/{len(results)} 通过   →  {outdir}")
+    # ==== APB_ARCHIVE BEGIN ====
+    # ⚠️ 打包失败**不进**失败计数，只在这里如实报一行 —— 备份数据本身是好的。
+    if eng.archive.enabled:
+        if eng.archive.ok:
+            print(f"打包：{eng.archive.display}"
+                  f"   耗时 {eng.archive.seconds:.1f}s")
+        else:
+            print(f"打包：未完成 —— {eng.archive.message}"
+                  f"{('（' + eng.archive.error + '）') if eng.archive.error else ''}")
+            print(f"      备份数据完好，压缩包只是额外的一份，不影响恢复。")
+    # ==== APB_ARCHIVE END ====
     return 0 if ok == len(results) else 2
 
 
