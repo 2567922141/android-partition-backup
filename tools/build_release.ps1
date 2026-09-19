@@ -23,8 +23,9 @@ $ToolDir = $Here
 $ToolDir = if ((Split-Path $Here -Leaf) -eq "tools") { Split-Path $Here -Parent } else { $Here }
 $WsRoot  = Split-Path $ToolDir -Parent
 $PortDir = Join-Path $WsRoot "android-partition-backup-portable"      # 已构建好的便携版
-$RelDir  = Join-Path $WsRoot "发布包"
 $Ver     = "1.1.1"
+$RelRoot = Join-Path $WsRoot "发布包"                                  # 各版本一个子目录
+$RelDir  = Join-Path $RelRoot "v$Ver"                                  # 本次的输出目录
 
 function Say($m, $c = "Gray") { Write-Host $m -ForegroundColor $c }
 function MB($p) {
@@ -40,7 +41,17 @@ Say "================================================================" Cyan
 Say ""
 
 if (-not (Test-Path $PortDir)) { throw "找不到便携版目录，请先运行 _build_portable.ps1" }
-if (Test-Path $RelDir) { Remove-Item $RelDir -Recurse -Force }
+# 逐个删除并容忍占用。**只清理本次版本自己的子目录** —— 发布包根目录下
+# 其它版本的子目录必须原样保留，那是历史归档。
+# 整目录 Remove-Item -Recurse -Force 遇到任何一个被占用的文件就会抛
+# IOException 并直接中断构建 —— 而发布包很容易正被资源管理器预览、
+# 或被聊天工具/压缩软件打开着。删不掉的就留着，交给下面的
+# Resolve-WritablePath 换名输出。
+if (Test-Path $RelDir) {
+    Get-ChildItem $RelDir -Recurse -Force |
+        Sort-Object FullName -Descending |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+}
 New-Item -ItemType Directory -Force -Path $RelDir | Out-Null
 
 # 优先用 7-Zip（更快、压缩率更高），没有就退回系统自带 Compress-Archive
@@ -295,16 +306,13 @@ Say ""
 Say "================================================================" Green
 Say "  发布包就绪" Green
 Say "================================================================" Green
-Say "  位置: $RelDir"
+Say "  版本目录: $RelDir"
+Say "  发布根目录: $RelRoot"
 Say ""
 
 # 清掉暂存与校验目录，只留两个 zip
 foreach ($d in @($ScriptPkg, $verifyDir)) {
     if (Test-Path $d) { Remove-Item $d -Recurse -Force -EA SilentlyContinue }
-}
-
-Get-ChildItem $RelDir | Sort-Object Name | ForEach-Object {
-    Say ("    {0,-46} {1,7} MB" -f $_.Name, [math]::Round($_.Length/1MB,1))
 }
 
 # 放一份选型说明在发布包里，省得以后忘了哪个是哪个
@@ -344,6 +352,29 @@ $pick = @"
 "@
 [System.IO.File]::WriteAllText((Join-Path $RelDir "WHICH-VERSION.txt"), $pick,
                                (New-Object System.Text.UTF8Encoding $true))
+
+# List this version's output. This must come AFTER WHICH-VERSION.txt is written,
+# otherwise the listing silently omits it.
+Say ""
+Say "  Files in this version folder:" Yellow
+Get-ChildItem $RelDir | Sort-Object Name | ForEach-Object {
+    Say ("    {0,-46} {1,7} MB" -f $_.Name, [math]::Round($_.Length/1MB,1))
+}
+
+# List every version archived under the release root.
+$versions = @(Get-ChildItem $RelRoot -Directory -EA SilentlyContinue |
+              Sort-Object Name -Descending)
+if ($versions.Count -gt 1) {
+    Say ""
+    Say "  Versions archived under the release root:" Yellow
+    foreach ($v in $versions) {
+        $n = @(Get-ChildItem $v.FullName -File -EA SilentlyContinue).Count
+        $s = (Get-ChildItem $v.FullName -File -EA SilentlyContinue |
+              Measure-Object Length -Sum).Sum
+        $mark = if ($v.Name -eq "v$Ver") { " <- this build" } else { "" }
+        Say ("    {0,-10} {1} file(s)  {2,7:N2} MB{3}" -f $v.Name, $n, ($s/1MB), $mark)
+    }
+}
 
 Say ""
 Say "  选哪个？" Yellow
