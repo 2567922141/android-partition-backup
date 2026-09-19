@@ -36,6 +36,7 @@ from backup_core import (          # noqa: E402
     find_previous_backup, write_manifest, write_readme, CORE_VERSION,
     default_backup_root, resolve_backup_dir, sanitize_folder_name,
     write_device_marker, read_device_marker, DEFAULT_BACKUP_NAME,
+    kill_live_children,
 )
 from partition_profiles import (   # noqa: E402
     PRESETS, PRESET_EXCLUDE, PLATFORM_GENERIC, PROFILES_VERSION,
@@ -421,6 +422,7 @@ class BackupApp:
         self.poll_paused = threading.Event()
         self.cancel_evt = threading.Event()
         self.worker: Optional[threading.Thread] = None
+        self.poll_thread: Optional[threading.Thread] = None
         self._last_devs: list = []
         self._probing = False
 
@@ -864,6 +866,7 @@ class BackupApp:
 
     def _start_poll_thread(self):
         t = threading.Thread(target=self._poll_loop, name="device-poll", daemon=True)
+        self.poll_thread = t
         t.start()
 
     def _poll_loop(self):
@@ -1400,13 +1403,60 @@ class BackupApp:
     # ======================================================================
 
     def _on_close(self):
+        """关窗 —— 必须把 adb 子进程一并收拾干净。
+
+        【为什么不能只 destroy()】adb 子进程是**独立进程**，Python 退出不会
+        顺带把它们带走。关窗时若正有一次 adb 调用在飞（设备轮询、读分区表、
+        或一次正在进行的备份），那个 adb.exe 就会变成孤儿留在任务管理器里 ——
+        用户看到的现象就是「程序关了还有进程占着」。
+
+        实测（Windows / Python 3.14）：`Popen(["adb","wait-for-device"])` 之后
+        直接让解释器退出，该 adb 进程依然存活。
+
+        所以按顺序做三件事：
+          ① 举旗，让后台线程别再发起新的 adb 调用
+          ② 给一小段收尾时间，然后把还活着的 adb 子进程全部 kill
+          ③ 等后台线程真正退出（它们会因 ② 立刻从阻塞里醒来）
+        """
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno(APP_TITLE, "备份正在进行，确定退出吗？"):
                 return
             self.cancel_evt.set()
-            time.sleep(0.3)
+
+        # ① 举旗
         self.poll_stop.set()
+
+        # ② 收尾 + 清子进程。给 0.35 秒让正常的调用自己跑完（大多数 adb
+        #    命令几十毫秒就返回了），剩下的强杀。
+        self._drain_ui(0.35)
+        leaked = kill_live_children()
+        if leaked:
+            self._log(f"[退出] 已回收 {leaked} 个仍在运行的 adb 子进程")
+
+        # ③ 等后台线程退出。这两个都是 daemon 线程，本来就会随进程结束 ——
+        #    等它们只是为了收尾干净，所以上限给得很短，别让用户点完 X 还等。
+        deadline = time.monotonic() + 0.6
+        while time.monotonic() < deadline:
+            alive = [t for t in (self.worker, getattr(self, "poll_thread", None))
+                     if t is not None and t.is_alive()]
+            if not alive:
+                break
+            if not self._drain_ui(0.05):
+                break
+
         self.root.destroy()
+
+    def _drain_ui(self, seconds: float) -> bool:
+        """在等待期间继续跑事件循环，避免界面假死。返回 False 表示窗口已没了。"""
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                self.root.update_idletasks()
+                self.root.update()
+            except tk.TclError:
+                return False
+            time.sleep(0.01)
+        return True
 
 
 # ==============================================================================

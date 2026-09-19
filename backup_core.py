@@ -54,6 +54,89 @@ from partition_profiles import (
 CORE_VERSION = "1.0.0"
 
 _CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+# ------------------------------------------------------------------ 子进程登记
+#
+# 【为什么需要】adb 子进程是**独立进程**，Python 退出不会顺带把它们带走。
+# 关窗时若正有一次 adb 调用在飞（设备轮询、读分区表、或一次备份），那个
+# adb.exe 就会变成孤儿留在任务管理器里 —— 用户看到的就是「程序关了还有
+# 进程占着」。
+#
+# 实测（Windows / Python 3.14）：`Popen(["adb", "wait-for-device"])` 之后
+# 直接让解释器退出，该 adb 进程**依然存活**（PID 15532）。
+#
+# 所以每次 spawn 都登记，退出前调 kill_live_children() 统一清掉。
+_children_lock = threading.Lock()
+_children: set = set()
+
+
+def _register_child(proc):
+    with _children_lock:
+        _children.add(proc)
+    return proc
+
+
+def _unregister_child(proc):
+    with _children_lock:
+        _children.discard(proc)
+
+
+def live_child_count() -> int:
+    """还活着的子进程数（测试用）。"""
+    with _children_lock:
+        return sum(1 for p in _children if p.poll() is None)
+
+
+def kill_live_children(wait: float = 1.5) -> int:
+    """杀掉所有还活着的子进程，返回杀掉的数量 —— 关窗时调用。
+
+    先 kill 再等一小会儿让句柄真正释放，否则 Windows 上文件可能仍被占用。
+    """
+    with _children_lock:
+        procs = list(_children)
+        _children.clear()
+    killed = []
+    for p in procs:
+        try:
+            if p.poll() is None:
+                p.kill()
+                killed.append(p)
+        except Exception:
+            pass
+    if killed and wait:
+        deadline = time.monotonic() + wait
+        for p in killed:
+            try:
+                left = deadline - time.monotonic()
+                if left > 0:
+                    p.wait(timeout=left)
+            except Exception:
+                pass
+    return len(killed)
+
+
+def _run(cmd, timeout=None, check=False, **kw):
+    """subprocess.run 的替代品 —— 登记子进程，退出时能被统一清掉。
+
+    返回值与 subprocess.run 完全一致（CompletedProcess），调用处无需改动。
+    """
+    p = subprocess.Popen(cmd, **kw)
+    _register_child(p)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        try:
+            p.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
+    finally:
+        _unregister_child(p)
+    if check and p.returncode != 0:
+        raise subprocess.CalledProcessError(p.returncode, cmd, out, err)
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 # 分区名：首字符必须是字母/数字/下划线 —— 这样 "." 与 ".." 会被直接拒绝。
 # （真实分区名如 persist / modemst1 / init_boot_a / vbmeta_system_a 都满足）
 _PART_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
@@ -619,7 +702,7 @@ class Adb:
     # ---------------------------------------------------------------- 执行
     def run(self, args: list[str], timeout: float = 60) -> tuple[bytes, bytes, int]:
         try:
-            p = subprocess.run(self._base() + args, stdout=subprocess.PIPE,
+            p = _run(self._base() + args, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,
                                creationflags=_CREATE_NO_WINDOW, timeout=timeout)
         except FileNotFoundError as e:
@@ -688,7 +771,7 @@ class Adb:
     @staticmethod
     def list_devices(adb_path: str) -> list[tuple[str, str]]:
         try:
-            p = subprocess.run([adb_path, "devices"], stdout=subprocess.PIPE,
+            p = _run([adb_path, "devices"], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,
                                creationflags=_CREATE_NO_WINDOW, timeout=20)
         except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -706,7 +789,7 @@ class Adb:
     @staticmethod
     def adb_version(adb_path: str) -> str:
         try:
-            p = subprocess.run([adb_path, "version"], stdout=subprocess.PIPE,
+            p = _run([adb_path, "version"], stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE,
                                creationflags=_CREATE_NO_WINDOW, timeout=15)
             first = p.stdout.decode("utf-8", "replace").splitlines()
@@ -953,6 +1036,7 @@ class Adb:
             proc = subprocess.Popen(
                 self._base() + ["exec-out", f"su -c '{remote}'"],
                 stdout=fout, stderr=ferr, creationflags=_CREATE_NO_WINDOW)
+            _register_child(proc)     # 关窗时能被统一清掉，不留孤儿 adb.exe
             last = 0
             last_size = -1
             stall_since = time.time()
@@ -979,6 +1063,7 @@ class Adb:
                     last = cur
                 time.sleep(0.20)
             proc.wait()
+            _unregister_child(proc)
             if progress_cb:
                 progress_cb(os.path.getsize(dest_path), time.time() - t0)
 
@@ -1026,7 +1111,7 @@ class Adb:
                 f"bs={DD_BLOCK_SIZE} 2>/dev/null", timeout=3600)
 
         try:
-            subprocess.run(self._base() + ["pull", remote_file, dest_path],
+            _run(self._base() + ["pull", remote_file, dest_path],
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                            creationflags=_CREATE_NO_WINDOW, timeout=7200)
         finally:
@@ -1089,6 +1174,7 @@ class Adb:
             p = subprocess.Popen(self._base() + ["exec-out", f"su -c '{cmd}'"],
                                  stdout=fout, stderr=ferr,
                                  creationflags=_CREATE_NO_WINDOW)
+            _register_child(p)        # 关窗时能被统一清掉，不留孤儿 adb.exe
             try:
                 p.wait(timeout=300)          # GPT 头尾各只有 1 MiB，300 秒绰绰有余
             except subprocess.TimeoutExpired:
@@ -1097,6 +1183,8 @@ class Adb:
                     p.wait(timeout=10)
                 except subprocess.TimeoutExpired:
                     pass
+            finally:
+                _unregister_child(p)
         err_text = ""
         try:
             with open(err_path, "rb") as f:
@@ -1140,7 +1228,7 @@ class Adb:
         它们没法像 exec-out 那样直接把字节流管道回本地。
         """
         try:
-            p = subprocess.run(self._base() + ["pull", remote, local_path],
+            p = _run(self._base() + ["pull", remote, local_path],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                creationflags=_CREATE_NO_WINDOW, timeout=timeout)
         except (subprocess.TimeoutExpired, OSError):
@@ -1514,7 +1602,7 @@ class BackupEngine:
         err_detail = ""
 
         try:
-            p = subprocess.run(self.adb._base() + ["pull", dev_tar, dest],
+            p = _run(self.adb._base() + ["pull", dev_tar, dest],
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                creationflags=_CREATE_NO_WINDOW, timeout=7200)
             local_size = os.path.getsize(dest) if os.path.exists(dest) else 0
@@ -1545,7 +1633,7 @@ class BackupEngine:
             stream_cmd = (f"cd /data/adb && {tar} -cz {excl} . 2>/dev/null")
             try:
                 with open(dest, "wb") as fh:
-                    sp = subprocess.run(
+                    sp = _run(
                         self.adb._base() + ["exec-out", f"su -c '{stream_cmd}'"],
                         stdout=fh, stderr=subprocess.PIPE,
                         creationflags=_CREATE_NO_WINDOW, timeout=7200)
