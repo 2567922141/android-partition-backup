@@ -473,6 +473,33 @@ Backups\
 
 > 📦 Module split: the packing logic lives in [`archive_pack.py`](archive_pack.py), fully decoupled from the backup engine.
 
+### While a Backup Is Running: Dangerous Actions Get Blocked (*New in v2.1.0*)
+
+Once a backup is under way, operations **that would interfere with this run are not disabled** — they **stay clickable, and clicking one pops up a dialog that explains why**:
+
+> 备份正在进行，暂时不能<动作>。请等它跑完，或先点「✕ 取消」。
+> (*"A backup is in progress; you cannot <action> right now. Wait for it to finish, or click ✕ Cancel first."*)
+
+Actions that get blocked: **refresh device / check root / start-stop the ADB server / change the output location (including "restore defaults") / change the profile / change a table tick**.
+
+**Why a dialog instead of graying the control out** — a grayed-out button does nothing when clicked and explains nothing either, so the user just assumes the program has frozen; a dialog can tell them directly "why this is not possible right now, and what to do about it". The price is that every entry point has to block the action itself.
+
+**Profile** and **table ticks** are not only blocked by a dialog but also **rolled back visually** (the radio button / checkbox snaps back to its pre-action state) — their widget state has already changed **before** the callback fires, so with a dialog alone the UI would read "profile B is now selected" while the run is still using the `self.checked` snapshot taken the moment the backup started.
+
+The only things grayed out during a backup are "start backup" and "open output directory" (clicking the former again would achieve nothing);
+**"✕ cancel" stays available the whole time** — deliberately: it is the one operation that can interrupt the task. The status bar shows
+**`备份进行中 —— 相关设置已锁定（点击会提示原因）`** (*"backup in progress — related settings are locked; clicking will explain why"*).
+
+**Three categories that are deliberately not blocked** (blocking them would make things worse):
+
+- **Filter box / the "hide low-value partitions" checkbox** — these change only the **visible rows** of the table, not what gets backed up (what really decides the content is the `self.checked` snapshot taken at the start), and they are bound to input events, so blocking them would mean "one dialog per keystroke".
+- **Output path field / backup name field** — these values are snapshotted into the engine the instant "start backup" is clicked, so changing them during a backup **does not affect this run**.
+- **The five option checkboxes** (backup GPT / environment bundle / device-side re-verification / fall back on failure / package into a ZIP) — same thing, all read at the moment the backup starts.
+
+> ⚠️ Side effect: because these fields stay editable, after the run finishes the values shown in the UI **may not match the ones this run actually used**.
+> When you change the backup name, if the directory computed for the path preview ≠ the directory actually being written to, the preview line gains a trailing
+> `⚠️ 本次备份仍在写入：<目录>` (*"this backup is still writing to: <dir>"*).
+
 ## 7. FAQ
 
 ### "No device detected"
@@ -569,7 +596,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Version | Changes |
 |---|---|
-| **2.1.0** | **New "package the backup into a ZIP when finished"** (optional, off by default) — ticking it produces one extra zip while **the original folder is left exactly as it is**. Uses the stdlib `zipfile` + `ZIP_DEFLATED`: **zero third-party dependencies, zero external processes**; measured on a real 971.5 MB backup → **138.7 MB (85.7% saved) in 5.2 seconds**. `ZIP_LZMA` is deliberately **not** used (smaller, but Windows Explorer cannot open it). A packaging failure **is not a backup failure**. Also fixes one real defect: `manifest.txt` / `README.md` / `backup_log.txt` are written **after** the backup finishes, so unless they were added to the zip the unpacked backup would be **missing its checksum manifest and restore notes** — now appended via zip's append mode. |
+| **2.1.0** | **New "package the backup into a ZIP when finished"** (optional, off by default) — ticking it produces one extra zip while **the original folder is left exactly as it is**. Uses the stdlib `zipfile` + `ZIP_DEFLATED`: **zero third-party dependencies, zero external processes**; measured on a real 971.5 MB backup → **138.7 MB (85.7% saved) in 5.2 seconds**. `ZIP_LZMA` is deliberately **not** used (smaller, but Windows Explorer cannot open it). A packaging failure **is not a backup failure**. Also fixes one real defect: `manifest.txt` / `README.md` / `backup_log.txt` are written **after** the backup finishes, so unless they were added to the zip the unpacked backup would be **missing its checksum manifest and restore notes** — now appended via zip's append mode. **Also adds a "task lock while a backup is running"** (2026-09-19): operations that would interfere with this run (refresh device / check root / start-stop the ADB server / change the output location / change the profile / change a table tick) **stay clickable, and clicking one pops up a dialog explaining why**, with the profile and table ticks additionally **rolled back visually**; the buttons are **deliberately not grayed out** — a grayed-out button does nothing when clicked and explains nothing either, so the user just assumes the program has frozen; "✕ cancel" stays available the whole time. |
 | **2.0.0** | **The GUI was migrated from Tkinter to PySide6 (Qt6)** — which finally kills the window-drag stutter at the root. Tk gives every widget its own HWND, so with 114 widgets nested 8 levels deep each resize cost 69 ms and eight Tk-side optimisations all failed; Qt measures 13.7 ms per resize, **4–5× faster**, and dragging finally keeps up with the cursor. Feature-for-feature identical to 1.1.1, with `backup_gui.py` (the Tk version) kept as a fallback. The package grew from 50 MB to 152 MB because it now bundles Qt |
 | 1.1.1 | **Device-side hashing is now on by default** — backups automatically compare against the phone's current partition via `sha256sum` (the only layer that proves the device bytes equal the disk bytes); partitions of 1 GiB or more are skipped automatically, and anything left unverified is reported honestly in the log and the dialog. **Fixed "diff against previous backup" being silently dead for partitions** (manifest lines with an empty `sub` were skipped wholesale by a `len(parts) >= 5` test, so only 18 of 45 entries were recognised). **`*_layout.txt` and `byname_mapping.txt` are now in the manifest** (they had no hash protection before). **New detailed device-info bar at the top** (system / chip / version / platform / kernel / ABI / RAM / screen / slot / patch / root, wrapping automatically in narrow windows); **ADB server switch moved to the top**; **ADB server now stops unconditionally on exit**; **fixed `adb.exe` being orphaned after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame, the limit of what Tk-side optimisation could reach); **fixed UI elements being hidden after resizing** — now a responsive layout |
 | 1.1.0 | Fixed all six LUNs' GPT tail backups failing (a local path was used as a device path); fixed the byte stream being polluted by stderr; fixed two whitelist validation gaps |
