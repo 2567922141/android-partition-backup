@@ -76,28 +76,32 @@ The 3 defects below were **not covered by a single one** of the AI's 87 assertio
 
 ### Requirements
 
-- **Python 3.8+** (including tkinter, which the official installer bundles by default)
+- **Python 3.9+** and **PySide6** (`python -m pip install PySide6`)
 - **ADB** — download it from [platform-tools](https://developer.android.com/tools/releases/platform-tools),
   put it at `adb/adb.exe` (Windows) or `adb/adb` (Linux/macOS), or just add it to your system PATH
 - A **rooted** Android phone (Magisk / KernelSU / APatch all work)
 
 > This repository does not include the ADB binary (an 8 MB binary in git history can never be slimmed down again), so please download it yourself.
+>
+> 💡 **Don't want to install Python and PySide6?** Use the **portable build** from the releases page — it bundles its own Python runtime and Qt,
+> so you just unzip it and double-click. Nothing to install.
 
 ### Running
 
 ```bash
 git clone https://github.com/2567922141/android-partition-backup.git
-cd android-partition-backup   # or whatever you cloned it as
+cd android-partition-backup
 
 # Put the adb from platform-tools here (pick one)
 #   A. Copy it to adb/adb.exe
 #   B. Add it to your system PATH
 #   C. Do nothing — the program finds it on PATH automatically
 
-python backup_gui.py         # launch the GUI
+python -m pip install PySide6   # the one and only third-party dependency
+python backup_gui_qt.py         # launch the GUI
 ```
 
-Linux / macOS users can use the bundled launch script directly (it picks a Python that has tkinter):
+Linux / macOS users can use the bundled launch script directly (it picks a Python that has PySide6):
 
 ```bash
 ./run.sh
@@ -291,8 +295,20 @@ The window is four panels top to bottom, with **device info and the ADB switch r
   ADB 服务: ● 运行中  [停止]   退出本程序时会自动停止 ADB 服务
 ──────────────────────────────────────────────────────────────────────
 
+④ 进度与日志 ────────────────────────────────────────────────
+  persist      [████████████░░░░░░░░░░░░░░]   48.2%
+               15.4 MB / 32.0 MB   11.9 MB/s   剩 2s
+  总计 5/13 项 [██████░░░░░░░░░░░░░░░░░░░░]   36.0%
+               36.0 MB / 100.0 MB   7.2 MB/s   剩 8s
+  ┌──────────────────────────────────────────────────────┐
+  │ [21:19:10] ===== 备份 13 个分区 =====                 │  ← 紫色标题
+  │ [21:19:10] 开始 persist  (32.0 MB)  [★不可再生]       │
+  │ [21:19:13]   [OK] persist  32.0 MB  2.7s  11.9MB/s   │  ← 绿色成功
+  │ [21:19:14]   [!] 流式失败，回退到设备端暂存模式 ...    │  ← 黄色告警
+  │ [21:19:20]   [X] modemst1 失败: 传输停滞超过 120 秒   │  ← 红色错误
+  └──────────────────────────────────────────────────────┘
 ```
-*(the panel title and field names are Chinese-only in the app; see the
+*(the panel titles and field names are Chinese-only in the app; see the
 [language note](#-about-this-project))*
 
 #### Device info panel
@@ -328,27 +344,10 @@ is modified.
 > expose a two-component `ro.kernel.version` like `5.15`, and letting it win
 > would leave you with just `5.15` on screen.
 >
-> 📐 The row is laid out with `FlowFrame`, so it **reflows when the window gets
+> 📐 The row is laid out with `FlowLayout` (a custom flow layout), so it **reflows when the window gets
 > narrow** instead of dropping fields (3 rows at 1060 px on the real device,
 > 4 at 760 px; measured, no overflow). Kernel / RAM / screen go through `shell`
 > rather than `su` — they need no root, so **these show even on an unrooted device**.
-
-#### Progress and log panel
-
-```
-④ 进度与日志 ────────────────────────────────────────────────
-  persist      [████████████░░░░░░░░░░░░░░]   48.2%
-               15.4 MB / 32.0 MB   11.9 MB/s   剩 2s
-  总计 5/13 项 [██████░░░░░░░░░░░░░░░░░░░░]   36.0%
-               36.0 MB / 100.0 MB   7.2 MB/s   剩 8s
-  ┌──────────────────────────────────────────────────────┐
-  │ [21:19:10] ===== 备份 13 个分区 =====                 │  ← 紫色标题
-  │ [21:19:10] 开始 persist  (32.0 MB)  [★不可再生]       │
-  │ [21:19:13]   [OK] persist  32.0 MB  2.7s  11.9MB/s   │  ← 绿色成功
-  │ [21:19:14]   [!] 流式失败，回退到设备端暂存模式 ...    │  ← 黄色告警
-  │ [21:19:20]   [X] modemst1 失败: 传输停滞超过 120 秒   │  ← 红色错误
-  └──────────────────────────────────────────────────────┘
-```
 
 **Four design points behind the progress bars / ETA**:
 
@@ -393,9 +392,12 @@ No element is ever clipped — **at any window size, on any resolution, under an
 | **Automatic reflow of horizontal rows** | Presets, bulk-action buttons and option switches wrap onto the next line in a narrow window instead of being pushed out of view |
 | **Dual scrollbars on the table and the log** | In a narrow window you can scroll horizontally, so columns and long log lines are never cut off |
 
-> **Why `pack(side="left")` cannot be used** — when the container is too narrow, `pack` pushes the **later widgets straight out of the visible area**, with no error and no warning. The symptom is "some buttons disappear after I make the window narrower".
-> **Why `grid` cannot be used either** — `grid` **shares column widths across the whole container**: after wrapping, a wide widget occupying column 0 widens that column, and **every other row shifts right as well**. Offsetting the column index by row number does not help, because row 1 still has to start after the columns used by row 0.
-> The final design is `FlowFrame` (computes its own wrapping coordinates) plus `ScrollHost` (scroll fallback).
+> **Why Tk's `pack(side="left")` was not an option** — when the container is too narrow, `pack` pushes the **later widgets straight out of the visible area**, with no error and no warning. The symptom is "some buttons disappear after I make the window narrower".
+> **Why Tk's `grid` was not an option either** — `grid` **shares column widths across the whole container**: after wrapping, a wide widget occupying column 0 widens that column, and **every other row shifts right as well**. Offsetting the column index by row number does not help either, because row 1 still has to start after the columns used by row 0.
+> The final design: a hand-written flow layout (`FlowFrame` in the Tk version, `FlowLayout` in the Qt version — both compute their own wrapping coordinates) plus a scrolling fallback (`ScrollHost` in the Tk version, `QScrollArea` in the Qt version).
+>
+> 📌 **Since v2.0.0**: Qt's layout system is simply far more robust than Tk's, and `QScrollArea` is a native widget rather than a hand-rolled Canvas solution.
+> The Tk-era war story above is kept because it explains **why this project insists on managing its own line wrapping** instead of leaving it to a layout manager.
 
 ### ADB server switch
 
@@ -463,10 +465,13 @@ if the program is installed in a read-only location such as Program Files, it au
 ## 8. Technical Architecture (for future maintainers)
 
 ```
-backup_gui.py          the GUI (Tkinter) — display and interaction only
+backup_gui_qt.py       the GUI (PySide6 / Qt6) — display and interaction only, **the default interface since v2.0.0**
   ├─ device poll thread polls `adb devices` every 1.5 s
   ├─ message queue       the only channel from worker thread → main thread
-  └─ root.after pump     the main thread drains the queue and repaints every 80 ms
+  └─ QTimer message pump the main thread drains the queue and repaints every 80 ms
+
+backup_gui.py          【旧版】the legacy GUI (Tkinter), the 1.x-era implementation, kept as a fallback
+  └─ feature-aligned with the Qt version, but noticeably stutters when a large window is resized (an architectural cause — see below)
 
 backup_core.py         the core engine (no GUI dependency; runs standalone from the CLI)
   ├─ Adb                adb.exe wrapper + capability probing
@@ -477,17 +482,23 @@ backup_core.py         the core engine (no GUI dependency; runs standalone from 
 partition_profiles.py  platform signatures + the four-tier partition rules (pure data)
 ```
 
-### Three Inviolable Design Constraints
+### Four Inviolable Design Constraints
 
-1. **Never touch tkinter from a worker thread**
-   Every call such as `BooleanVar.get()` must be completed on the main thread and only then passed to the worker —
-   otherwise you get random deadlocks or crashes. This is the most classic Tkinter pitfall.
+1. **Never touch GUI objects from a worker thread**
+   Every call such as `QLineEdit.text()` / `QCheckBox.isChecked()` must be completed on the main thread and only then passed to the worker —
+   otherwise Qt simply crashes (`QObject: Cannot create children for a parent in a different thread`) or segfaults at random.
+   Qt is stricter than Tkinter here: **across a thread boundary you can only pass data, never widgets**.
 
-2. **A/B slot suffixes must be stripped before rule matching**
+2. **Why v2.0.0 moved from Tkinter to Qt**
+   On Windows, Tk creates **a real HWND for every single widget**. This program has 114 widgets nested 8 levels deep, so every window resize made Windows re-adjust and repaint all of them — measured at **69 ms per resize**, and while dragging, the event queue could never catch up.
+   Eight Tk-side optimisations were tried (flattening the hierarchy, freezing relayout, dropping the scrollbars, moving the content out of the Canvas…), and **none of them helped**, because this was not a matter of badly written code — it was decided by Tk's architecture.
+   Qt widgets do not own a separate HWND; resizing is a repaint rather than a window rebuild — measured at **13.7 ms per resize, 4–5× faster**.
+
+3. **A/B slot suffixes must be stripped before rule matching**
    The rule table is written with unslotted names (`abl`), while on the device it is actually called `abl_a`.
    Not stripping the suffix leaves a large number of partitions "unclassified". See `classify()`.
 
-3. **GPT offsets must be computed in Python**
+4. **GPT offsets must be computed in Python**
    The shell's `[ ]` comparison **overflows 32 bits** into a negative number for values like 253 GB,
    causing the tail GPT to be silently skipped. Python is natively 64-bit and has no such problem.
 
@@ -502,17 +513,18 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Item | Value |
 |---|---|
-| Tool version | **1.1.1** |
+| Tool version | **2.0.0** |
 | Core version | 1.0.0 |
 | Profile library version | 1.0.0 |
-| Dependencies | Python standard library only (tkinter), **zero third-party packages** |
-| Portable package size | About 50 MB (including the Python runtime + ADB)|
+| Dependencies | **PySide6** (the GUI) + the Python standard library. The core engine, `backup_core.py`, still has **zero third-party dependencies** and runs standalone from the CLI |
+| Portable package size | About 152 MB (including the Python runtime + PySide6 + ADB)|
 
 ### Changelog
 
 | Version | Changes |
 |---|---|
-| **1.1.1** | **Device-side hash is now on by default** — at backup time the phone's own `sha256sum` is compared against the local bytes (the only layer that proves the device bytes equal the disk bytes); partitions above 1 GiB are skipped automatically, and anything left unverified is reported honestly. **Fixed "diff against previous backup" being silently dead for partitions** (manifest lines with an empty `sub` were skipped by a `len(parts) >= 5` test, so only 18 of 45 entries were recognised). **`*_layout.txt` and `byname_mapping.txt` are now registered in the manifest.** **New detailed device-info bar at the top**; **ADB server switch moved to the top**; **ADB server always stops on exit**; **fixed `adb.exe` being orphaned after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame); **fixed UI elements being hidden after resizing** — responsive layout |
+| **2.0.0** | **The GUI was migrated from Tkinter to PySide6 (Qt6)** — which finally kills the window-drag stutter at the root. Tk gives every widget its own HWND, so with 114 widgets nested 8 levels deep each resize cost 69 ms and eight Tk-side optimisations all failed; Qt measures 13.7 ms per resize, **4–5× faster**, and dragging finally keeps up with the cursor. Feature-for-feature identical to 1.1.1, with `backup_gui.py` (the Tk version) kept as a fallback. The package grew from 50 MB to 152 MB because it now bundles Qt |
+| 1.1.1 | **Device-side hashing is now on by default** — backups automatically compare against the phone's current partition via `sha256sum` (the only layer that proves the device bytes equal the disk bytes); partitions of 1 GiB or more are skipped automatically, and anything left unverified is reported honestly in the log and the dialog. **Fixed "diff against previous backup" being silently dead for partitions** (manifest lines with an empty `sub` were skipped wholesale by a `len(parts) >= 5` test, so only 18 of 45 entries were recognised). **`*_layout.txt` and `byname_mapping.txt` are now in the manifest** (they had no hash protection before). **New detailed device-info bar at the top** (system / chip / version / platform / kernel / ABI / RAM / screen / slot / patch / root, wrapping automatically in narrow windows); **ADB server switch moved to the top**; **ADB server now stops unconditionally on exit**; **fixed `adb.exe` being orphaned after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame, the limit of what Tk-side optimisation could reach); **fixed UI elements being hidden after resizing** — now a responsive layout |
 | 1.1.0 | Fixed all six LUNs' GPT tail backups failing (a local path was used as a device path); fixed the byte stream being polluted by stderr; fixed two whitelist validation gaps |
 
 ---

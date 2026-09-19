@@ -71,28 +71,32 @@
 
 ### 环境要求
 
-- **Python 3.8+**（含 tkinter，官方安装包默认自带）
+- **Python 3.9+** 与 **PySide6**（`python -m pip install PySide6`）
 - **ADB** —— 从 [platform-tools](https://developer.android.com/tools/releases/platform-tools) 下载，
   放到 `adb/adb.exe`（Windows）或 `adb/adb`（Linux/macOS），或直接加进系统 PATH
 - 一台**已 root** 的安卓手机（Magisk / KernelSU / APatch 均可）
 
 > 本仓库不含 ADB 二进制（8 MB 的二进制进 git 历史后无法瘦身），请自行下载。
+>
+> 💡 **不想装 Python 和 PySide6？** 用发布页的**便携版** —— 自带 Python 运行时与 Qt，
+> 解压双击就能用，什么都不用装。
 
 ### 运行
 
 ```bash
-git clone <本仓库地址>
-cd 安卓分区备份工具          # 或你 clone 下来的目录名
+git clone https://github.com/2567922141/android-partition-backup.git
+cd android-partition-backup
 
 # 把 platform-tools 里的 adb 放进来（三选一）
 #   A. 复制到 adb/adb.exe
 #   B. 加进系统 PATH
 #   C. 什么都不做 —— 程序会自动从 PATH 找
 
-python backup_gui.py         # 启动图形界面
+python -m pip install PySide6   # 只有这一项第三方依赖
+python backup_gui_qt.py         # 启动图形界面
 ```
 
-Linux / macOS 用户可直接用附带的启动脚本（会自动挑一个带 tkinter 的 Python）：
+Linux / macOS 用户可直接用附带的启动脚本（会自动挑一个装了 PySide6 的 Python）：
 
 ```bash
 ./run.sh
@@ -320,7 +324,7 @@ python backup_core.py --adb <adb路径> --list        # 只列出设备分区与
 > 同样地，内核以 `uname -r` 为准：有些 ROM 的 `ro.kernel.version` 只有 `5.15`
 > 这种两位短值，让它抢先的话界面上就只剩个 `5.15` 了。
 >
-> 📐 这一排用 `FlowFrame` 铺，**窗口窄了自动折行**，不会丢字段
+> 📐 这一排用 `FlowLayout`（自定义流式布局）铺，**窗口窄了自动折行**，不会丢字段
 > （真机 1060px 宽时 3 行；760px 时 4 行，实测无越界）。
 > 内核/内存/屏幕走的是 `shell` 而不是 `su` —— 这几项普通权限就能读，
 > **没 root 的设备也能看到**。
@@ -368,9 +372,12 @@ python backup_core.py --adb <adb路径> --preset critical --out <输出目录>
 | **横排控件自动折行** | 预设方案、批量按钮、选项开关等在窄窗口下折到下一行，而不是被挤出可视区 |
 | **分区表格 / 日志双滚动条** | 窗口很窄时横向可拖，列与长日志行不会被切掉 |
 
-> **为什么不能用 `pack(side="left")`** —— 容器宽度不足时，`pack` 会把**排在后面的控件直接挤出可视区**，既不报错也不提示。表现就是「把窗口调窄之后有些按钮不见了」。
-> **为什么也不能用 `grid`** —— `grid` 的**列宽是整个容器共享的**：折行后某个宽控件占了第 0 列，这一列就被撑宽，**其它行也跟着右移**。把列号按行号错开也没用，因为第 1 行仍然要排在第 0 行那些列之后。
-> 最终方案：`FlowFrame`（自己算坐标折行）+ `ScrollHost`（滚动兜底）。
+> **为什么不能靠 Tk 的 `pack(side="left")`** —— 容器宽度不足时，`pack` 会把**排在后面的控件直接挤出可视区**，既不报错也不提示。表现就是「把窗口调窄之后有些按钮不见了」。
+> **为什么也不能用 Tk 的 `grid`** —— `grid` 的**列宽是整个容器共享的**：折行后某个宽控件占了第 0 列，这一列就被撑宽，**其它行也跟着右移**。把列号按行号错开也没用，因为第 1 行仍然要排在第 0 行那些列之后。
+> 最终方案：自写流式布局（`FlowFrame` / Qt 版的 `FlowLayout`，自己算坐标折行）+ 滚动兜底（`ScrollHost` / Qt 版的 `QScrollArea`）。
+>
+> 📌 **v2.0.0 之后**：Qt 的布局系统本身就比 Tk 稳健得多，`QScrollArea` 也是原生控件而非手写 Canvas 方案。
+> 上面这段 Tk 时代的踩坑记录保留下来，是因为它解释了**为什么这个项目一定要自己管折行**，而不是交给布局管理器。
 
 ### ADB 服务开关
 
@@ -438,10 +445,13 @@ python backup_core.py --adb <adb路径> --preset critical --out <输出目录>
 ## 八、技术架构（给未来的维护者）
 
 ```
-backup_gui.py          图形界面（Tkinter），只负责显示与交互
+backup_gui_qt.py       图形界面（PySide6 / Qt6），只负责显示与交互，**v2.0.0 起的默认界面**
   ├─ 设备轮询线程       每 1.5 秒查一次 adb devices
   ├─ 消息队列 queue     工作线程 → 主线程的唯一通道
-  └─ root.after 消息泵  主线程每 80ms 取一次队列并刷新界面
+  └─ QTimer 消息泵      主线程每 80ms 取一次队列并刷新界面
+
+backup_gui.py          【旧版】图形界面（Tkinter），1.x 时代的实现，保留作回退
+  └─ 与 Qt 版功能对齐，但缩放大尺寸窗口时明显卡顿（架构原因，见下）
 
 backup_core.py         核心引擎（无 GUI 依赖，可 CLI 独立运行）
   ├─ Adb                adb.exe 封装 + 能力探测
@@ -452,17 +462,25 @@ backup_core.py         核心引擎（无 GUI 依赖，可 CLI 独立运行）
 partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 ```
 
-### 三条不可违背的设计约束
+### 四条不可违背的设计约束
 
-1. **绝不从工作线程碰 tkinter**
-   所有 `BooleanVar.get()` 之类的调用必须在主线程完成后再传给工作线程 ——
-   否则会随机死锁或崩溃。这是 Tkinter 最经典的坑。
+1. **绝不从工作线程碰 GUI 对象**
+   所有 `QLineEdit.text()` / `QCheckBox.isChecked()` 之类的调用必须在主线程完成后再传给工作线程 ——
+   否则 Qt 会直接崩（`QObject: Cannot create children for a parent in a different thread`）或随机段错误。
+   Qt 在这点上比 Tkinter 更严格：**跨越线程边界只能传数据，不能传控件**。
 
-2. **必须剥离 A/B 槽位后缀再匹配规则**
+2. **为什么 v2.0.0 要从 Tkinter 换到 Qt**
+   Tk 在 Windows 上给**每个控件建一个真实 HWND**。本程序 114 个控件、嵌套 8 层，
+   每次改窗口大小 Windows 都要重新调整并重绘它们 —— 实测 **69 ms/次**，拖拽时事件队列永远追不上。
+   试过 8 种 Tk 侧优化（扁平化、冻结重排、摘掉滚动条、把内容移出 Canvas……）**全部无效**，
+   因为这不是代码写得不好，是 Tk 的架构决定的。
+   Qt 的控件不占独立 HWND，缩放是重绘而非窗口重建 —— 实测 **13.7 ms/次，快 4~5 倍**。
+
+3. **必须剥离 A/B 槽位后缀再匹配规则**
    规则表按无槽位名写（`abl`），设备上实际叫 `abl_a`。
    不剥后缀会导致大量分区"未分类"。见 `classify()`。
 
-3. **GPT 偏移必须在 Python 里算**
+4. **GPT 偏移必须在 Python 里算**
    shell 的 `[ ]` 比较对 253 GB 这种数值会 **32 位溢出**成负数，
    导致尾部 GPT 被静默跳过。Python 原生 64 位，没有这个问题。
 
@@ -477,17 +495,18 @@ partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 
 | 项目 | 值 |
 |---|---|
-| 工具版本 | **1.1.1** |
+| 工具版本 | **2.0.0** |
 | 核心版本 | 1.0.0 |
 | 画像库版本 | 1.0.0 |
-| 依赖 | 仅 Python 标准库（tkinter），**零第三方包** |
-| 便携包体积 | 约 50 MB（含 Python 运行时 + ADB）|
+| 依赖 | **PySide6**（图形界面）+ Python 标准库。核心引擎 `backup_core.py` 仍**零第三方依赖**，可独立 CLI 运行 |
+| 便携包体积 | 约 152 MB（含 Python 运行时 + PySide6 + ADB）|
 
 ### 更新记录
 
 | 版本 | 变化 |
 |---|---|
-| **1.1.1** | **设备端哈希改为默认开启** —— 备份时自动与手机当前分区比对 `sha256sum`（唯一能证明「设备上的字节 == 硬盘上的字节」的一层）；≥1 GiB 的分区自动跳过；未验成的会在日志和弹窗里如实报出。**修复「对比上次备份」对分区一直失效** —— manifest 里 `sub` 为空的行被 `len(parts) >= 5` 判据整批跳过，45 条只认出 18 条。**`*_layout.txt` 与 `byname_mapping.txt` 补进 manifest**（此前没有哈希保护）。**顶部新增详细设备信息栏**（系统/芯片/版本/平台/内核/架构/内存/屏幕/槽位/补丁/Root，窄窗口自动折行）；**ADB 服务开关移到顶部**；**ADB 服务改为退出时无条件停止**；**修复关窗后 `adb.exe` 变成孤儿进程**；**修复拖拽窗口卡顿**（每帧 146ms → 54ms）；**修复窗口缩放后界面元素被隐藏** —— 改为响应式布局 |
+| **2.0.0** | **图形界面从 Tkinter 迁移到 PySide6（Qt6）** —— 根治拖拽窗口卡顿。Tk 给每个控件建独立 HWND，114 控件 8 层嵌套下每次缩放要 69 ms，试过 8 种 Tk 侧优化全部无效；Qt 实测 13.7 ms/次，**快 4~5 倍**，拖拽终于跟手。功能与 1.1.1 完全对齐，`backup_gui.py`（Tk 版）保留作回退。体积因内置 Qt 从 50 MB 增至 152 MB |
+| 1.1.1 | **设备端哈希改为默认开启** —— 备份时自动与手机当前分区比对 `sha256sum`（唯一能证明「设备上的字节 == 硬盘上的字节」的一层）；≥1 GiB 的分区自动跳过；未验成的会在日志和弹窗里如实报出。**修复「对比上次备份」对分区一直失效** —— manifest 里 `sub` 为空的行被 `len(parts) >= 5` 判据整批跳过，45 条只认出 18 条。**`*_layout.txt` 与 `byname_mapping.txt` 补进 manifest**（此前没有哈希保护）。**顶部新增详细设备信息栏**（系统/芯片/版本/平台/内核/架构/内存/屏幕/槽位/补丁/Root，窄窗口自动折行）；**ADB 服务开关移到顶部**；**ADB 服务改为退出时无条件停止**；**修复关窗后 `adb.exe` 变成孤儿进程**；**修复拖拽窗口卡顿**（每帧 146ms → 54ms，Tk 侧优化的极限）；**修复窗口缩放后界面元素被隐藏** —— 改为响应式布局 |
 | 1.1.0 | 修复 6 个 LUN 的 GPT 尾部全部失败（本地路径被当成设备路径）；修复字节流被 stderr 污染；修复两处白名单校验缺口 |
 
 ---
