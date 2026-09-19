@@ -732,12 +732,15 @@ class BackupApp:
         r4.pack(fill="x")
         self.opt_gpt = tk.BooleanVar(value=True)
         self.opt_env = tk.BooleanVar(value=False)
-        self.opt_devverify = tk.BooleanVar(value=False)
+        # 默认开 —— 设备端算一遍 sha256sum 跟本地比对，是唯一能证明
+        # 「设备上的字节 == 硬盘上的字节」的一层。对关键分区（几十 MB）
+        # 耗时只有零点几秒；超过 1 GB 的分区引擎会自动跳过。
+        self.opt_devverify = tk.BooleanVar(value=True)
         self.opt_fallback = tk.BooleanVar(value=True)
 
         r4.add(ttk.Checkbutton(r4, text="备份 GPT 分区表", variable=self.opt_gpt))
         r4.add(ttk.Checkbutton(r4, text="打包 /data/adb 环境", variable=self.opt_env))
-        r4.add(ttk.Checkbutton(r4, text="设备端二次校验（慢，最严格）",
+        r4.add(ttk.Checkbutton(r4, text="设备端二次校验（推荐；≥1GB 自动跳过）",
                                variable=self.opt_devverify))
         r4.add(ttk.Checkbutton(r4, text="失败自动回退", variable=self.opt_fallback))
 
@@ -1547,15 +1550,27 @@ class BackupApp:
         ok = sum(1 for x in results if x.ok)
         bad = len(results) - ok
         total = sum(x.real_size for x in results if x.ok)
+        # 设备端校验的战果 —— 让用户看得见这一层到底跑了没跑
+        dv_ok = sum(1 for x in results if x.device_verified is True)
+        dv_no = sum(1 for x in results if x.device_verified is False)
         if bad == 0:
             self._set_result(f"✅ 全部通过 {ok}/{len(results)}", "Ok.TLabel")
         else:
             self._set_result(f"⚠️ {ok} 通过 / {bad} 失败", "Warn.TLabel")
         self._status(f"完成：{ok}/{len(results)} 通过，共 {human_size(total)}")
+        if dv_ok:
+            self._log(f"  其中 {dv_ok} 项与设备端哈希核对一致", "ok")
+        if dv_no:
+            self._log(f"  [!] {dv_no} 项没能做设备端校验（设备端没算出哈希）", "warn")
 
         prev = r.get("prev")
         msg = (f"备份完成\n\n通过 {ok} / 共 {len(results)} 项\n"
-               f"总大小 {human_size(total)}\n\n输出目录：\n{r['outdir']}")
+               f"总大小 {human_size(total)}")
+        if dv_ok:
+            msg += f"\n设备端校验：{dv_ok} 项哈希一致 ✅"
+        if dv_no:
+            msg += f"\n⚠️ {dv_no} 项未做设备端校验"
+        msg += f"\n\n输出目录：\n{r['outdir']}"
         if prev:
             msg += f"\n\n已与上次备份对比：\n{os.path.basename(prev)}"
         if bad:

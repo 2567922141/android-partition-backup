@@ -696,6 +696,9 @@ class ItemResult:
     message: str = ""
     seconds: float = 0.0
     path_mode: str = PATH_MODE_STREAM
+    # 是否真的和设备端哈希对过了。None = 这一项不适用（GPT/TAR 等）；
+    # False = 想做但设备端没结果（要如实告诉用户，不能假装验过）
+    device_verified: Optional[bool] = None
 
     @property
     def label(self) -> str:
@@ -1459,7 +1462,13 @@ class Adb:
 class EngineOptions:
     do_gpt: bool = True
     do_env: bool = False
-    verify_device_side: bool = False
+    # 默认开 —— 这是唯一能证明「设备上的字节 == 硬盘上的字节」的一层
+    verify_device_side: bool = True
+    # 超过这个大小就不做设备端校验了（0 = 不限）。
+    # 关键分区全在这个阈值之下：persist 32MB、modemst1/2 8MB、fsg 8MB、
+    # devinfo 16MB、frb 512KB、secdata 32KB —— 校验耗时可以忽略。
+    # 跳过的只有 super(9GB)/userdata(226GB) 这类可再生的大块头。
+    verify_max_size: int = HUGE_THRESHOLD
     allow_fallback: bool = True
     exclude_busybox: bool = True
     skip_boot_disks: bool = True      # eMMC 的 boot0/boot1 默认不碰
@@ -1542,17 +1551,40 @@ class BackupEngine:
             self._emit(phase="hash", item=name, done=0, expect=size)
             res.sha256 = sha256_file(dest, cancel=self.cancel)
 
+            # 设备端二次校验 —— 这是**唯一能证明「设备上的字节 == 你硬盘上的字节」**
+            # 的一层。头尾抽样、双读比对、第二条传输路径能抓的东西它全抓得到，
+            # 所以有它就不需要那些了。
+            #
+            # 代价是设备要把分区再读一遍算 sha256。UFS 顺序读 1~2 GB/s，
+            # 而 adb 传输通常是 30~150 MB/s —— 也就是说对同一个分区，
+            # 校验耗时只有传输耗时的百分之几，基本等于白送。
+            # 但 super(9GB)/userdata(226GB) 这种大到离谱的还是会拖时间，
+            # 而且它们本来就是可再生的，所以超过阈值就自动跳过。
             if self.opt.verify_device_side:
-                self.log(f"  设备端二次校验 {name} ...")
-                dev = self.adb.su(
-                    f"sha256sum /dev/block/by-name/{name} 2>/dev/null", timeout=1800)
-                dev_sha = dev.split()[0] if dev.strip() else ""
-                if dev_sha and dev_sha != res.sha256:
-                    res.ok = False
-                    res.message = (f"设备端哈希不一致 设备={dev_sha[:16]} "
-                                   f"本地={res.sha256[:16]}")
-                    self.log(f"  [X] {name}：{res.message}")
-                    return res
+                cap = self.opt.verify_max_size
+                if cap and size > cap:
+                    self.log(f"  [i] {name} 有 {human_size(size)}，"
+                             f"超过 {human_size(cap)} 的校验上限，跳过设备端校验")
+                else:
+                    self.log(f"  设备端校验 {name} ...")
+                    dev = self.adb.su(
+                        f"sha256sum /dev/block/by-name/{name} 2>/dev/null",
+                        timeout=1800)
+                    dev_sha = dev.split()[0] if dev.strip() else ""
+                    if dev_sha and dev_sha != res.sha256:
+                        res.ok = False
+                        res.message = (f"设备端哈希不一致 设备={dev_sha[:16]} "
+                                       f"本地={res.sha256[:16]}")
+                        self.log(f"  [X] {name}：{res.message}")
+                        return res
+                    if not dev_sha:
+                        # 设备端没算出哈希（没有 sha256sum、权限不足…）
+                        # 不当作失败，但必须说出来 —— 否则用户以为验过了
+                        self.log(f"  [!] {name} 设备端没算出哈希，"
+                                 f"这一项未做二次校验")
+                        res.device_verified = False
+                    else:
+                        res.device_verified = True
 
             res.ok = True
             res.message = "OK"
@@ -1685,6 +1717,9 @@ class BackupEngine:
                 lay = os.path.join(self.gpt_dir, f"{disk.name}_layout.txt")
                 with open(lay, "w", encoding="utf-8") as f:
                     f.write(render_layout(disk.name, hdr, entries, size))
+                # 登记进 manifest —— 这张表是手工重建 GPT 时的唯一依据，
+                # 跟镜像一样需要哈希保护，烂了要能查出来
+                outs.append(self._file_result("GPT", disk.name, "layout", lay))
                 self.log(f"      {disk.name}: 逻辑扇区={hdr.sector_size} "
                          f"MBR={hdr.mbr_sig} GPT={'OK' if hdr.valid else hdr.detail} "
                          f"分区={len(entries)} 个")
@@ -1905,9 +1940,12 @@ class BackupEngine:
             mapping = self.adb.su(f"ls -l {byname}/ 2>/dev/null; true", timeout=60)
             target_dir = self.gpt_dir if self.opt.do_gpt else self.outdir
             os.makedirs(target_dir, exist_ok=True)
-            with open(os.path.join(target_dir, "byname_mapping.txt"),
-                      "w", encoding="utf-8") as f:
+            bnm = os.path.join(target_dir, "byname_mapping.txt")
+            with open(bnm, "w", encoding="utf-8") as f:
                 f.write(mapping)
+            # 同样登记进 manifest：恢复时靠它把分区名对到设备节点
+            self.results.append(
+                self._file_result("TXT", "byname_mapping", "", bnm))
             self.log(f"已保存 by-name 映射表（{len(mapping.splitlines())} 行）")
         except (AdbError, OSError) as e:
             self.log(f"[!] by-name 映射表保存失败: {e}")
@@ -2148,18 +2186,66 @@ def write_manifest(outdir: str, results: Iterable[ItemResult], meta: dict) -> st
     return path
 
 
-def load_previous_hashes(manifest_path: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    if not os.path.exists(manifest_path):
-        return out
+MANIFEST_KINDS = ("PART", "GPT", "TAR", "TXT")
+
+
+def parse_manifest_line(line: str) -> Optional[dict]:
+    """解析 manifest 的一行数据。
+
+    格式:  TYPE NAME [SUB] SIZE SHA256
+    —— SUB 可能为空，被 split() 吃掉，所以段数是不定的：
+
+        PART persist  33554432 <sha>          4 段（SUB 为空）
+        GPT  sda head_1M 1048576 <sha>        5 段（有 SUB）
+        TAR  data_adb.tar.gz  43952010 <sha>  4 段（SUB 为空）
+
+    ⚠️ 老版本这里写的是 `len(parts) >= 5`，结果**所有 SUB 为空的行全部被
+    静默跳过** —— 真机那份 manifest 45 条数据只认出 18 条（恰好是 18 个
+    GPT 行），27 个 PART 和 1 个 TAR 一个都没认出来，「对比上次备份」
+    这个功能对分区一直是失效的。所以这里改成按段数分情况判断。
+    """
+    parts = line.strip().split()
+    if len(parts) < 4 or parts[0] not in MANIFEST_KINDS:
+        return None
+    kind, name = parts[0], parts[1]
+    if len(parts) >= 5:
+        sub, size, sha = parts[2], parts[3], parts[4]
+    else:
+        sub, size, sha = "", parts[2], parts[3]
+    if sha.upper().startswith("FAILED:"):
+        return None
     try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
+        size_i = int(size)
+    except ValueError:
+        return None
+    return {"kind": kind, "name": name, "sub": sub,
+            "size": size_i, "sha256": sha.lower()}
+
+
+
+def read_manifest(manifest_path: str) -> list:
+    """读 manifest，返回条目列表（跳过解析不了的行的同时记下来）。"""
+    entries: list = []
+    if not os.path.exists(manifest_path):
+        return entries
+    try:
+        with open(manifest_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 5 and parts[0] in ("PART", "GPT", "TAR", "TXT"):
-                    out[f"{parts[0]}|{parts[1]}|{parts[2]}"] = parts[4].lower()
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                e = parse_manifest_line(s)
+                if e:
+                    entries.append(e)
     except OSError:
         pass
+    return entries
+
+
+def load_previous_hashes(manifest_path: str) -> dict:
+    out: dict = {}
+    for e in read_manifest(manifest_path):
+        out[f"{e['kind']}|{e['name']}|{e['sub']}"] = e["sha256"]
     return out
 
 
@@ -2335,7 +2421,9 @@ def _cli():
     ap.add_argument("--partition", action="append", default=[])
     ap.add_argument("--no-gpt", action="store_true")
     ap.add_argument("--env", action="store_true")
-    ap.add_argument("--verify-device", action="store_true")
+    ap.add_argument("--no-verify-device", dest="verify_device",
+                    action="store_false", default=True,
+                    help="关掉设备端二次校验（默认开启）")
     ap.add_argument("--quiet", action="store_true", help="不显示实时进度条")
     ap.add_argument("--list", action="store_true", help="列出设备/分区/分级后退出")
     args = ap.parse_args()

@@ -206,16 +206,57 @@ This project absolutely does not leak any personal information.
 
 ## 5. Verification
 
-For every partition it backs up, the program will:
+The point of verification is **not** to compute more hashes — it is to make sure
+**each layer catches a failure mode the previous layer cannot**. So the checkpoints
+are deliberately placed at *different points* along the data path:
 
-1. **Transfer**: `adb exec-out` **redirects** the output of `dd` **straight into** a local file
-2. **Byte-count check**: the number of bytes received must be **exactly identical** to the partition size reported by `blockdev --getsize64`
-3. **Local SHA256**: streaming hash computed over the file as it is written
-4. **GPT structure validation** (for GPT items): pure Python parsing of the MBR `55AA` + GPT `EFI PART` signatures,
-   plus a head ↔ tail cross-check (the two must point at each other)
-5. **Optional second check on the device**: when enabled, the device additionally computes its own `sha256sum` for comparison against the local one
+```
+Device flash ──①device-side hash──▶ adb transfer ──②PC-side hash──▶ disk
+                closes the transfer loop        confirms the write
+```
 
-> If the byte counts do not match, it automatically **falls back** to the slower but more robust "stage on the device + adb pull" path and retries.
+> Running sha256 / sha1 / md5 in parallel is **not** "multiple layers" — they read
+> the same bytes and catch the same class of error. **Only a different position
+> counts as a layer.**
+
+### ① Device-side hash (on by default) ⭐
+
+The device computes its own `sha256sum /dev/block/by-name/<partition>` first, and it
+is compared against the bytes received on the PC.
+
+This is the **only** layer that can prove **the bytes on the device equal the bytes
+on your disk**. Head/tail sampling, double reads, a second transfer path — everything
+they could catch, this already catches.
+
+**It costs essentially nothing**: UFS sequential reads run at 1–2 GB/s while adb
+transfers typically run at 30–150 MB/s — so for the same partition the check takes
+only a few percent of the transfer time.
+
+Partitions above **1 GiB** are skipped automatically (by then you are dealing with
+regenerable `super` / `userdata`).
+
+| Partition | Size | Device-side check |
+|---|---|---|
+| `secdata` | 32 KB | ✅ checked |
+| `frp` | 512 KB | ✅ checked |
+| `modemst1` / `modemst2` / `fsg` | 8 MB | ✅ checked |
+| `devinfo` | 16 MB | ✅ checked |
+| `persist` | 32 MB | ✅ checked |
+| `recovery_a` / `boot_a` | 100–192 MB | ✅ checked |
+| `super` | 9 GB | skipped |
+| `userdata` | 226 GB | skipped |
+
+**Every non-regenerable partition falls below the threshold** — the ones that
+matter most are always verified.
+
+To turn it off: untick "设备端二次校验" in the GUI, or pass `--no-verify-device`.
+
+> If the device fails to produce a hash for any reason (no `sha256sum`, insufficient
+> permissions…), the program does **not** treat it as a failure — but it says so
+> explicitly in the log and reports the unverified count in the completion dialog.
+> It never pretends a check happened.
+
+### ② PC-side hash + exact byte count
 
 ### Why must `exec-out` be used instead of `shell`?
 
@@ -471,7 +512,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Version | Changes |
 |---|---|
-| **1.1.1** | **New detailed device-info bar at the top** (system / chip / build / platform / kernel / ABI / RAM / screen / slot / patch / root, reflowing on narrow windows); **ADB server switch moved to the top**; **ADB server now always stops on exit** (checkbox removed); **fixed `adb.exe` becoming an orphan process after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame); **fixed UI elements being hidden after resizing the window** — replaced with a responsive layout: automatic reflow of horizontal rows, scrollable-canvas fallback, window size measured from the screen |
+| **1.1.1** | **Device-side hash is now on by default** — at backup time the phone's own `sha256sum` is compared against the local bytes (the only layer that proves the device bytes equal the disk bytes); partitions above 1 GiB are skipped automatically, and anything left unverified is reported honestly. **Fixed "diff against previous backup" being silently dead for partitions** (manifest lines with an empty `sub` were skipped by a `len(parts) >= 5` test, so only 18 of 45 entries were recognised). **`*_layout.txt` and `byname_mapping.txt` are now registered in the manifest.** **New detailed device-info bar at the top**; **ADB server switch moved to the top**; **ADB server always stops on exit**; **fixed `adb.exe` being orphaned after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame); **fixed UI elements being hidden after resizing** — responsive layout |
 | 1.1.0 | Fixed all six LUNs' GPT tail backups failing (a local path was used as a device path); fixed the byte stream being polluted by stderr; fixed two whitelist validation gaps |
 
 ---
