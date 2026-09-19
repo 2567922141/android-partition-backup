@@ -489,6 +489,97 @@ class DeviceCaps:
         return bool(self.sgdisk)
 
 
+# ------------------------------------------------------------------ 芯片型号
+#
+# ⚠️ 只在 ro.soc.model（Android 12+）**缺失**时才查这张表，而且查到了也一定把
+# 原始平台代号一并显示 —— 不做「猜一个好看的型号」这种事。
+# 表里只放把握得住的常见平台，其余一律显示原始值。
+_BOARD_FRIENDLY = {
+    "kalama": "骁龙 8 Gen 2",
+    "pineapple": "骁龙 8 Gen 3",
+    "sun": "骁龙 8 Elite",
+    "taro": "骁龙 8 Gen 1",
+    "cape": "骁龙 8+ Gen 1",
+    "waipio": "骁龙 8 Gen 1",
+    "lahaina": "骁龙 888",
+    "shima": "骁龙 888",
+    "kona": "骁龙 865",
+    "msmnile": "骁龙 855",
+    "holi": "骁龙 695",
+    "mt6983": "天玑 9000",
+    "mt6985": "天玑 9200",
+    "mt6989": "天玑 9300",
+    "mt6897": "天玑 8300",
+    "zuma": "Tensor G3",
+    "gs201": "Tensor G2",
+}
+
+_SOC_MAKER_CN = {
+    "qualcomm": "高通", "qti": "高通", "qualcomm technologies, inc": "高通",
+    "mediatek": "联发科", "mtk": "联发科",
+    "samsung": "三星", "exynos": "三星",
+    "unisoc": "紫光展锐", "spreadtrum": "紫光展锐",
+    "hisilicon": "海思", "huawei": "海思",
+    "google": "Google",
+}
+
+
+def describe_soc(info: "DeviceInfo") -> str:
+    """把芯片信息拼成一句人话。
+
+    优先级：ro.soc.model（Android 12+ 的权威值）> 平台代号对照表 > ro.hardware。
+    查表命中时会带上原始代号，方便你核对。
+    """
+    model = (info.soc_model or "").strip()
+    board = (info.board or "").strip()
+    hardware = (info.hardware or "").strip()
+    maker_raw = (info.soc_maker or "").strip()
+    maker = _SOC_MAKER_CN.get(maker_raw.lower(), maker_raw)
+    friendly = _BOARD_FRIENDLY.get(board.lower(), "")
+
+    if model:
+        base = f"{friendly}（{model}）" if friendly and friendly not in model else model
+    elif friendly:
+        base = friendly
+    else:
+        base = board or hardware
+
+    parts = [p for p in (base, maker) if p]
+    # 用了友好名就不必再重复平台代号；否则把它补上，别丢信息
+    if board and not friendly and board.lower() not in base.lower():
+        parts.append(board)
+    return " · ".join(parts)
+
+
+def parse_sysinfo(text: str, kernel_fallback: str = "") -> tuple[str, str, str]:
+    """解析 `uname -r; head -1 /proc/meminfo; wm size` 的输出。
+
+    返回 (内核, 内存, 屏幕)。任一项取不到就返回空串。
+
+    ⚠️ 内核以 `uname -r` 为准。有些 ROM 的 ro.kernel.version 只有 "5.15"
+    这种两位短值，若让它抢先，界面上就只剩个 "5.15" 了。
+    """
+    kernel = ""
+    ram = ""
+    screen = ""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("MemTotal:"):
+            m = re.search(r"(\d+)", line)
+            if m:
+                try:
+                    ram = human_size(int(m.group(1)) * 1024)
+                except (ValueError, OverflowError):
+                    pass
+        elif line.startswith(("Physical size:", "Override size:")):
+            screen = line.split(":", 1)[1].strip()
+        elif re.match(r"^\d+\.\d+[\w.\-]*", line):
+            kernel = line
+    return (kernel or kernel_fallback), ram, screen
+
+
 @dataclass
 class DeviceInfo:
     serial: str = ""
@@ -505,6 +596,23 @@ class DeviceInfo:
     platform: Platform = PLATFORM_GENERIC
     platform_score: int = 0
     caps: DeviceCaps = field(default_factory=DeviceCaps)
+
+    # ---- 详情字段（顶部设备信息栏用）----
+    # 取不到一律留空串，界面显示 "—"。绝不为了好看去猜一个值。
+    build_id: str = ""          # ro.build.display.id（系统构建号，如 OS3.0.307.0.WNKCNXM）
+    security_patch: str = ""    # ro.build.version.security_patch
+    soc_model: str = ""         # ro.soc.model（Android 12+ 才有）
+    soc_maker: str = ""         # ro.soc.manufacturer
+    board: str = ""             # ro.board.platform（如 kalama）
+    hardware: str = ""          # ro.hardware（如 qcom）
+    abi: str = ""               # ro.product.cpu.abi
+    kernel: str = ""            # uname -r
+    ram: str = ""               # /proc/meminfo MemTotal，已格式化
+    screen: str = ""            # wm size
+    os_name: str = ""           # ro.mi.os.version.name / ro.miui.ui.version.name
+    fingerprint: str = ""       # ro.build.fingerprint
+
+
 
     @property
     def ready(self) -> bool:
@@ -951,6 +1059,12 @@ class Adb:
             "ro.product.device", "ro.product.vendor.device",
             "ro.build.version.release", "ro.build.version.sdk",
             "ro.build.version.incremental", "ro.boot.slot_suffix",
+            # ---- 详情栏 ----
+            "ro.build.display.id", "ro.build.version.security_patch",
+            "ro.soc.model", "ro.soc.manufacturer", "ro.board.platform",
+            "ro.hardware", "ro.product.cpu.abi", "ro.build.fingerprint",
+            "ro.mi.os.version.name", "ro.miui.ui.version.name",
+            "ro.kernel.version",
         ])
         info.brand = props.get("ro.product.brand") or props.get("ro.product.manufacturer", "")
         info.model = props.get("ro.product.model", "")
@@ -960,6 +1074,27 @@ class Adb:
         info.sdk = props.get("ro.build.version.sdk", "")
         info.version = props.get("ro.build.version.incremental", "")
         info.slot = props.get("ro.boot.slot_suffix", "")
+
+        info.build_id = props.get("ro.build.display.id", "")
+        info.security_patch = props.get("ro.build.version.security_patch", "")
+        info.soc_model = props.get("ro.soc.model", "")
+        info.soc_maker = props.get("ro.soc.manufacturer", "")
+        info.board = props.get("ro.board.platform", "")
+        info.hardware = props.get("ro.hardware", "")
+        info.abi = props.get("ro.product.cpu.abi", "")
+        info.fingerprint = props.get("ro.build.fingerprint", "")
+        info.os_name = (props.get("ro.mi.os.version.name")
+                        or props.get("ro.miui.ui.version.name", ""))
+        info.kernel = props.get("ro.kernel.version", "")
+
+        # 内核 / 内存 / 屏幕：一条 shell 一次拿完，省往返。
+        # 走 shell 而不是 su —— 这几项普通权限就能读，没 root 的设备也能看到。
+        try:
+            extra = self.shell("uname -r; head -1 /proc/meminfo; "
+                               "wm size 2>/dev/null; true", timeout=25)
+            info.kernel, info.ram, info.screen = parse_sysinfo(extra, info.kernel)
+        except Exception:
+            pass
 
         if ok:
             info.caps = self.probe_capabilities()

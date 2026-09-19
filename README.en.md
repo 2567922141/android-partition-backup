@@ -234,6 +234,66 @@ Measured data (a 32 MB persist partition):
 
 ### GUI
 
+The window is four panels top to bottom, with **device info and the ADB switch right at the top**:
+
+```
+① 设备状态 ──────────────────────────────────────────────────────────
+  ●  已连接  6f06de3d                          [刷新设备] [检查 Root]
+     代号 vermeer · 识别为 高通 Qualcomm（得分 16） · root ✓ KernelSU
+
+  系统 Android 16（SDK 36）  系统版本 OS3.0.307.0.WNKCNXM
+  芯片 骁龙 8 Gen 2（SM8550）· 高通          平台 kalama
+  内核 5.15.194-android13-8-00019-gf4321180a397-ab15212794
+  架构 arm64-v8a             内存 14.8 GB      屏幕 1440x3200
+  槽位 _a（当前系统槽）       补丁 2026-08-01   Root ✓ uid=0（u:r:ksu:s0）
+
+  ADB 服务: ● 运行中  [停止]   退出本程序时会自动停止 ADB 服务
+──────────────────────────────────────────────────────────────────────
+
+```
+*(the panel title and field names are Chinese-only in the app; see the
+[language note](#-about-this-project))*
+
+#### Device info panel
+
+Every field is read straight from the system (`getprop` + `uname` +
+`/proc/meminfo` + `wm size`) in a single round trip. Nothing on the device
+is modified.
+
+| Field | Source | Notes |
+|---|---|---|
+| 系统 System | `ro.build.version.release` / `.sdk` | e.g. `Android 16（SDK 36）` |
+| 系统版本 OS build | `ro.build.version.incremental` | e.g. `OS3.0.307.0.WNKCNXM` |
+| 芯片 Chip | `ro.soc.model` / `ro.soc.manufacturer` | authoritative on Android 12+ |
+| 平台 Platform | `ro.board.platform` | Qualcomm internal codename, e.g. `kalama` |
+| 内核 Kernel | `uname -r` | |
+| 架构 ABI | `ro.product.cpu.abi` | e.g. `arm64-v8a` |
+| 内存 RAM | `/proc/meminfo` MemTotal | |
+| 屏幕 Screen | `wm size` | physical resolution |
+| 槽位 Slot | `ro.boot.slot_suffix` | active slot on A/B devices |
+| 补丁 Patch | `ro.build.version.security_patch` | |
+| Root | `su -c id` | includes the SELinux context |
+
+> 🔍 **The chip name is never guessed.** `ro.soc.model` is used whenever present;
+> a *very small* board-codename table (`kalama → Snapdragon 8 Gen 2`) is consulted
+> only as a fallback, and the raw codename is always shown alongside so you can
+> verify it. Anything unavailable renders as `—` — never invented.
+>
+> ⚠️ **"系统版本 / OS build" comes from `ro.build.version.incremental`, not
+> `ro.build.display.id`.** On Xiaomi/Redmi the latter is the **AOSP build ID**
+> (measured: `BP2A.250605.031.A3`), which is *not* the version shown under
+> Settings → About phone — we got this wrong at first and only real-device
+> verification caught it. Likewise the kernel comes from `uname -r`: some ROMs
+> expose a two-component `ro.kernel.version` like `5.15`, and letting it win
+> would leave you with just `5.15` on screen.
+>
+> 📐 The row is laid out with `FlowFrame`, so it **reflows when the window gets
+> narrow** instead of dropping fields (3 rows at 1060 px on the real device,
+> 4 at 760 px; measured, no overflow). Kernel / RAM / screen go through `shell`
+> rather than `su` — they need no root, so **these show even on an unrooted device**.
+
+#### Progress and log panel
+
 ```
 ④ 进度与日志 ────────────────────────────────────────────────
   persist      [████████████░░░░░░░░░░░░░░]   48.2%
@@ -298,7 +358,8 @@ No element is ever clipped — **at any window size, on any resolution, under an
 
 ### ADB server switch
 
-The UI has a row: **`ADB 服务: ● 运行中  [停止]  退出本程序时会自动停止 ADB 服务`**.
+The UI has a row: **`ADB 服务: ● 运行中  [停止]  退出本程序时会自动停止 ADB 服务`** —
+**in the "① 设备状态" panel at the very top**, right next to *refresh device* / *check root*, so it is always within reach.
 
 | Control | What it does |
 |---|---|
@@ -410,7 +471,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Version | Changes |
 |---|---|
-| **1.1.1** | **New: ADB server switch** (start/stop manually, plus automatic stop on exit); **fixed `adb.exe` becoming an orphan process after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame); **fixed UI elements being hidden after resizing the window** — replaced with a responsive layout: automatic reflow of horizontal rows, scrollable-canvas fallback, window size measured from the screen |
+| **1.1.1** | **New detailed device-info bar at the top** (system / chip / build / platform / kernel / ABI / RAM / screen / slot / patch / root, reflowing on narrow windows); **ADB server switch moved to the top**; **ADB server now always stops on exit** (checkbox removed); **fixed `adb.exe` becoming an orphan process after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame); **fixed UI elements being hidden after resizing the window** — replaced with a responsive layout: automatic reflow of horizontal rows, scrollable-canvas fallback, window size measured from the screen |
 | 1.1.0 | Fixed all six LUNs' GPT tail backups failing (a local path was used as a device path); fixed the byte stream being polluted by stderr; fixed two whitelist validation gaps |
 
 ---

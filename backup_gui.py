@@ -38,6 +38,7 @@ from backup_core import (          # noqa: E402
     write_device_marker, read_device_marker, DEFAULT_BACKUP_NAME,
     kill_live_children,
     adb_server_running, adb_start_server, adb_stop_server,
+    describe_soc, parse_sysinfo,
 )
 from partition_profiles import (   # noqa: E402
     PRESETS, PRESET_EXCLUDE, PLATFORM_GENERIC, PROFILES_VERSION,
@@ -46,6 +47,17 @@ from partition_profiles import (   # noqa: E402
 
 APP_TITLE = "安卓分区备份工具"
 APP_VERSION = "1.1.1"
+
+# 顶部设备信息栏显示的字段 —— 顺序即显示顺序。
+# 用 FlowFrame 铺，窗口窄了会自动折行，不会丢字段。
+#
+# ⚠️ 实测坑：ro.build.display.id 在小米上是 **AOSP 构建号**（BP2A.250605.031.A3），
+#    不是用户看到的系统版本号。真正的版本号在 ro.build.version.incremental
+#    （= OS3.0.307.0.WNKCNXM），也就是 DeviceInfo.version。
+DEVICE_INFO_FIELDS = (
+    "系统", "系统版本", "芯片", "平台", "内核", "架构",
+    "内存", "屏幕", "槽位", "补丁", "Root",
+)
 
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
@@ -171,9 +183,15 @@ class FlowFrame(ttk.Frame):
         return widgets
 
     def refresh(self):
-        """子控件文本变了（宽度随之变化）之后重新测量排布。"""
+        """子控件文本变了（宽度随之变化）之后重新测量排布。
+
+        ⚠️ 必须先 update_idletasks：改完 -text 之后 Tk 要等到下一次几何计算
+        才会更新 winfo_reqwidth，直接量会量到**旧值** —— 表现就是值被截成两
+        三个字符（量到的是原来那个 "—" 的宽度）。
+        """
         self._last_w = -1
         self._boxes.clear()
+        self.update_idletasks()
         self._settle()
 
     def _on_configure(self, event):
@@ -529,6 +547,81 @@ class BackupApp:
         self.btn_root = ttk.Button(btns, text="检查 Root", command=self._probe_now)
         self.btn_root.pack(side="left", padx=3)
 
+        # ---- 详细信息：一排排 `名称 值`，宽度不够自动折行 ----
+        # 用 FlowFrame 而不是 grid：grid 的列宽是整个容器共享的，某个值特别长
+        # 会把整列撑宽、带着其它行一起右移（见 README 里那段说明）。
+        self.info_grid = FlowFrame(f, gap=20, row_gap=4)
+        self.info_grid.pack(fill="x", pady=(9, 0))
+        self._info_labels = {}
+        for key in DEVICE_INFO_FIELDS:
+            cell = ttk.Frame(self.info_grid)
+            ttk.Label(cell, text=key, style="Sub.TLabel").pack(side="left")
+            val = ttk.Label(cell, text="—", anchor="w")
+            val.pack(side="left", padx=(6, 0))
+            self.info_grid.add(cell)
+            self._info_labels[key] = val
+
+        # ---- ADB 服务开关（放在顶部，方便随手启停）----
+        # 服务端是**多个工具共用**的常驻进程（Android Studio / scrcpy 也在用
+        # 同一个）。所以这里给出显式开关；退出时则**无条件**停掉它，不留残留。
+        srv = FlowFrame(f, gap=12, row_gap=6)
+        srv.pack(fill="x", pady=(9, 0))
+        self.srv_row = srv
+        self.lbl_srv = ttk.Label(srv, text="ADB 服务: 检测中 ...")
+        self.btn_srv = ttk.Button(srv, text="启动", width=8, command=self._toggle_server)
+        srv.add(self.lbl_srv)
+        srv.add(self.btn_srv, gap=8)
+        srv.add(ttk.Label(srv, text="退出本程序时会自动停止 ADB 服务",
+                          style="Sub.TLabel"), gap=16)
+        self._srv_running = None
+        self._srv_busy = False
+
+        self.root.after(400, self._refresh_server_state)
+        self.root.after(2500, self._tick_server_state)
+
+    def _set_device_details(self, info: Optional[DeviceInfo]):
+        """把设备详情填进顶部那一排 `名称 值`。取不到的显示 "—"。"""
+        if not hasattr(self, "_info_labels"):
+            return
+
+        def g(v):
+            return (str(v).strip() if v else "") or "—"
+
+        android = g(info.android if info else "")
+        sdk = (info.sdk if info else "") or ""
+        if android != "—" and sdk:
+            android = f"Android {android}（SDK {sdk}）"
+        elif android != "—":
+            android = f"Android {android}"
+
+        soc = describe_soc(info) if info else ""
+        root = ""
+        if info and info.root_ok:
+            root = "✓ uid=0" + (f"（{info.root_context}）" if info.root_context else "")
+        elif info:
+            root = "✗ 不可用"
+
+        slot = (info.slot if info else "") or ""
+        if slot:
+            slot = f"{slot}（当前系统槽）"
+
+        vals = {
+            "系统": android,
+            "系统版本": g(info.version if info else ""),
+            "芯片": g(soc),
+            "平台": g(info.board if info else ""),
+            "内核": g(info.kernel if info else ""),
+            "架构": g(info.abi if info else ""),
+            "内存": g(info.ram if info else ""),
+            "屏幕": g(info.screen if info else ""),
+            "槽位": slot or "—",
+            "补丁": g(info.security_patch if info else ""),
+            "Root": root or "—",
+        }
+        for key, lbl in self._info_labels.items():
+            lbl.configure(text=vals.get(key, "—"))
+        self.info_grid.refresh()        # 文字宽度变了，重新折行
+
     # ---------------------------------------------------------- ② 分区选择
     def _build_partition_panel(self, parent):
         f = ttk.LabelFrame(parent, text=" ② 选择要备份的分区 ", padding=10)
@@ -648,24 +741,7 @@ class BackupApp:
                                variable=self.opt_devverify))
         r4.add(ttk.Checkbutton(r4, text="失败自动回退", variable=self.opt_fallback))
 
-        # ---- ADB 服务 ----
-        # 服务端是**多个工具共用**的常驻进程（Android Studio / scrcpy 也在用
-        # 同一个）。所以这里给出显式开关；退出时则**无条件**停掉它，不留残留。
-        r5 = FlowFrame(f, gap=12, row_gap=6)
-        r5.pack(fill="x", pady=(10, 0))
-        self.srv_row = r5
-        self.lbl_srv = ttk.Label(r5, text="ADB 服务: 检测中 ...")
-        self.btn_srv = ttk.Button(r5, text="启动", width=8, command=self._toggle_server)
-        r5.add(self.lbl_srv)
-        r5.add(self.btn_srv, gap=8)
-        r5.add(ttk.Label(r5, text="退出本程序时会自动停止 ADB 服务",
-                         style="Sub.TLabel"), gap=16)
-        self._srv_running = None
-        self._srv_busy = False
-
         self.root.after(300, self._preview_path)
-        self.root.after(400, self._refresh_server_state)
-        self.root.after(2500, self._tick_server_state)
 
     # ---------------------------------------------------------- ADB 服务
     def _tick_server_state(self):
@@ -1032,6 +1108,7 @@ class BackupApp:
                 text="请确认：USB 已连接 / 已开启 USB 调试 / 手机上已点“允许” / 屏幕已解锁")
             self.btn_start.configure(state="disabled")
             self.adb, self.info, self.partitions = None, None, []
+            self._set_device_details(None)
             self._render_rows()
             return
         serial, state = devs[0]
@@ -1061,9 +1138,12 @@ class BackupApp:
         adb.classify_all(parts, platform)
 
         self.partitions = parts
-        sub = (f"Android {info.android} (SDK {info.sdk}) · {info.version} · "
-               f"{platform.display} · 槽位 {info.slot or '无'} · "
-               f"root {'✓ ' + info.caps.root_backend_name if info.root_ok else '✗'}")
+        self._set_device_details(info)
+
+        # 概要行只说「识别结果」—— 具体型号/系统/芯片都在上面那排详情里了
+        root_txt = ("✓ " + info.caps.root_backend_name) if info.root_ok else "✗"
+        sub = (f"代号 {info.codename or '未知'} · 识别为 {platform.display}"
+               f"（得分 {score}） · root {root_txt}")
         if not info.root_ok:
             self.lbl_dot.configure(foreground="#b42318")
             self.lbl_devsub.configure(text=sub + "  ← root 不可用，无法读取分区")
