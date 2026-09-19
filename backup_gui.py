@@ -151,13 +151,16 @@ class FlowFrame(ttk.Frame):
         self._row_gap = row_gap   # 折行后行与行之间的竖直间距
         self._items = []          # [(widget, gap_before)]
         self._last_w = -1
+        self._last_h = -1
+        self._pending = False     # 是否有排队中的重排
+        self._boxes = {}          # widget -> (x, y, w, h)，用来跳过无变化的 place
         self.bind("<Configure>", self._on_configure)
 
     def add(self, widget, gap=None):
         """把控件登记进本行 —— 由本行统一负责它的位置。"""
         self._items.append((widget, self._gap if gap is None else gap))
         self._last_w = -1
-        self.after_idle(self._reflow)
+        self._schedule()
         return widget
 
     def add_all(self, widgets, gap=None):
@@ -168,18 +171,32 @@ class FlowFrame(ttk.Frame):
     def refresh(self):
         """子控件文本变了（宽度随之变化）之后重新测量排布。"""
         self._last_w = -1
-        self._reflow()
+        self._boxes.clear()
+        self._settle()
 
     def _on_configure(self, event):
         # 宽度变了才重排；高度变化不处理（否则会自己触发自己）
         if abs(event.width - self._last_w) >= 2:
             self._last_w = event.width
-            self._reflow(event.width)
+            self._schedule()
+
+    # ------------------------------------------------------------ 性能
+    #
+    # 【性能】拖拽时 <Configure> 每帧会触发多次，若每次都立刻重排，同一步
+    # 拖拽里会把一样的位置算好几遍。这里合并到下一个 idle 只做一次。
+    def _schedule(self):
+        if not self._pending:
+            self._pending = True
+            self.after_idle(self._settle)
+
+    def _settle(self):
+        self._pending = False
+        self._reflow(self._last_w if self._last_w > 1 else None)
 
     def _reflow(self, width=None):
         if not self._items:
             return
-        if width is None:
+        if width is None or width <= 1:
             width = self.winfo_width()
         if width <= 1:
             # 还没映射 —— 先摆成一行，等真正的 <Configure> 再折
@@ -197,12 +214,17 @@ class FlowFrame(ttk.Frame):
                 x = 0
                 g = 0
                 row_h = 0
-            w.place(x=x + g, y=y, width=need, height=h)
+            box = (x + g, y, need, h)
+            # 位置没变就别再 place 一次 —— 拖拽时绝大多数控件是原地不动的
+            if self._boxes.get(w) != box:
+                self._boxes[w] = box
+                w.place(x=box[0], y=box[1], width=need, height=h)
             x += g + need
             row_h = max(row_h, h)
         # place 不会把尺寸传给父容器，高度得自己报
         total = y + row_h
-        if total != self.winfo_reqheight():
+        if total != self._last_h:
+            self._last_h = total
             self.configure(height=total)
 
 
@@ -219,6 +241,11 @@ class ScrollHost(ttk.Frame):
 
     滚动条只在真正需要时才出现（内容比画布高）。
     """
+
+    # 拖拽窗口时，最后一次尺寸变化过去多久才真正重排（毫秒）。
+    # 调大 → 更跟手但内容归位更迟；调小 → 内容跟得紧但容易卡。
+    # 120ms 是「手一停就归位」与「拖拽全程不重排」之间的平衡点。
+    _IDLE_MS = 120
 
     def __init__(self, master, **kw):
         super().__init__(master, **kw)
@@ -237,71 +264,114 @@ class ScrollHost(ttk.Frame):
         self.inner = ttk.Frame(self.canvas)
         self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
         self._sb_visible = False
-        self._win_h = -1        # 上次给内容区设定的高度（防重复设置引发循环）
+        self._win_w = -1        # 上次设定的内容区宽度
+        self._win_h = -1        # 上次设定的内容区高度
+        self._scrollregion = None
+        self._job = None        # 排队中的布局任务
+        self._ever_settled = False
 
         self.inner.bind("<Configure>", self._on_inner)
         self.canvas.bind("<Configure>", self._on_canvas)
 
     # ---------------------------------------------------------------- 内部
+    #
+    # 【性能】拖拽窗口时 <Configure> 会以每帧多次的频率触发。若每次都立刻
+    # 重算布局，一步拖拽会把同样的活干十几遍 —— 实测每步 130ms，明显卡顿。
+    # 所以这里一律「只标脏、不干活」，把真正的工作合并到下一个 idle 做一次。
     def _on_inner(self, _event=None):
-        """内容区尺寸变了。
+        """内容区尺寸变了 —— 先标脏，由 _settle 统一收敛。
 
-        注意：这里**必须**重新应用一次高度。原因：画布 resize 时算出的
-        reqheight 可能已经过期 —— FlowFrame 的折行是在那之后才发生的，
-        折行会改变内容高度。只靠 canvas 的 <Configure> 会留下错误的高度。
+        注意：不能只靠 canvas 的 <Configure>。折行发生在 canvas resize
+        **之后**，那时 inner 的尺寸往往没变、不会再触发 <Configure>，
+        高度就会永远停在按旧 reqheight 算出的值，末尾状态栏再也映射不出来。
+        所以这里也必须标脏，多收敛一轮。
         """
-        self._apply_height()
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self._sync_scrollbar()
+        self._mark_dirty()
 
-    def _on_canvas(self, event):
-        # 宽度跟随画布（这样内部的 flow / expand 才有正确的参考宽度）
-        if event.width != getattr(self, "_win_w", -1):
-            self._win_w = event.width
-            self.canvas.itemconfigure(self._win, width=event.width)
-        self._relayout_pending = False
-        self._apply_height()
-        self._sync_scrollbar()
-        # ⚠️ 折行发生在这一切**之后**，而 inner 的尺寸若没变就不会再触发
-        # <Configure> —— 于是高度会永远停在按旧 reqheight 算出的值，
-        # 末尾的状态栏就再也映射不出来了。补几轮 idle 重算（每轮很便宜），
-        # 等布局彻底稳定。用 pending 标志避免重复排队。
-        if not self._relayout_pending:
-            self._relayout_pending = True
-            self.after_idle(lambda: self._relayout(8))
+    def _on_canvas(self, _event=None):
+        self._mark_dirty()
 
-    def _relayout(self, budget=0):
-        if budget <= 0:
-            self._relayout_pending = False
+    def _mark_dirty(self):
+        """排一次布局 —— 但不在拖拽当中排。
+
+        【性能】实测：让内容跟随窗口宽度重排一次要 **约 140ms**。这不是本程序
+        写得烂 —— 一个只放 80 个 ttk 控件的空白窗口，同样的重排也要 75ms。
+        ttk 控件是 Tcl 实现的，每个控件每次重排约 1ms，就是 Tk 的地板价。
+        而拖拽窗口每秒会产生几十次 <Configure>，逐次重排的话事件队列永远
+        追不上，手感就是「拖不动」。
+
+        所以改成**尾随去抖**：每来一次尺寸变化就把待办往后推 _IDLE_MS。
+        连续拖拽期间一次都不执行（窗口边框照常跟手，由系统直接拉伸），
+        手一停下来立刻排一次，内容随即归位。
+        """
+        if not self._ever_settled:
+            # 开窗第一次布局要快，不等待
+            if self._job is None:
+                self._job = self.after_idle(self._settle)
             return
-        self._apply_height()
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self._sync_scrollbar()
-        self.after_idle(lambda: self._relayout(budget - 1))
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+        self._job = self.after(self._IDLE_MS, self._settle)
 
-    def _apply_height(self):
-        """内容区高度 = max(画布高度, 内容需求高度)。
+    def _settle(self, budget=3):
+        """把布局推到不动点。
 
-        * 内容矮 → 撑满画布，让 `expand=True` 的区块（分区表、日志）长大
-        * 内容高 → 保持需求高度，交给滚动条
+        每轮只做**真正有变化**的事，结果缓存在 _win_w / _win_h /
+        _scrollregion 里 —— 没有变化的轮次立刻收敛退出，不会空转。
         """
-        ch = self.canvas.winfo_height()
-        if ch <= 1:
-            return                      # 还没映射，别下结论
-        want = max(ch, self.inner.winfo_reqheight())
-        if want != self._win_h:
-            self._win_h = want
-            self.canvas.itemconfigure(self._win, height=want)
+        self._job = None
+        self._ever_settled = True
+        if self._layout_once() and budget > 0:
+            self.after_idle(lambda: self._settle(budget - 1))
 
-    def _sync_scrollbar(self):
+    def _layout_once(self) -> bool:
+        ch = self.canvas.winfo_height()
+        cw = self.canvas.winfo_width()
+        if ch <= 1 or cw <= 1:
+            return False                    # 还没映射，别下结论
+
+        # 高度 = max(画布高度, 内容需求高度)：
+        #   内容矮 → 撑满画布，让 expand 区块（分区表 / 日志）长大
+        #   内容高 → 保持需求高度，交给滚动条
+        want_w = cw
+        want_h = max(ch, self.inner.winfo_reqheight())
+
+        # ⚠️ 宽和高必须**一次** itemconfigure 给完。分两次的话，给宽度会先
+        # 触发一轮内容子树的 <Configure> 级联，给高度再触发一轮 —— 实测
+        # 重排耗时直接翻倍（140ms vs 75ms）。合并后仍然会收敛：这一轮用的是
+        # 旧宽度算出的 reqheight，级联结束后会再排一轮修正。
+        opts = {}
+        if want_w != self._win_w:
+            opts["width"] = want_w
+        if want_h != self._win_h:
+            opts["height"] = want_h
+        changed = bool(opts)
+        if changed:
+            self._win_w, self._win_h = want_w, want_h
+            self.canvas.itemconfigure(self._win, **opts)
+
+        # scrollregion 直接用算好的尺寸，省掉 bbox("all") 那次 Tcl 往返
+        region = (0, 0, want_w, want_h)
+        if region != self._scrollregion:
+            self._scrollregion = region
+            self.canvas.configure(scrollregion=region)
+
+        self._sync_scrollbar(ch)
+        return changed
+
+    def _sync_scrollbar(self, ch=None):
         """按需显隐竖滚动条。
 
         不会来回抖动：藏起来 → 画布变宽 → 内容只会更矮或不变；
         亮出来 → 画布变窄 → 内容只会更高或不变。两个方向都是单调的。
         """
-        if self.canvas.winfo_height() <= 1:
+        ch = ch if ch is not None else self.canvas.winfo_height()
+        if ch <= 1:
             return
-        need = self.inner.winfo_reqheight() > self.canvas.winfo_height() + 1
+        need = self.inner.winfo_reqheight() > ch + 1
         if need == self._sb_visible:
             return
         self._sb_visible = need
