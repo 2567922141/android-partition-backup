@@ -51,9 +51,9 @@ APP_VERSION = "1.1.1"
 # 顶部设备信息栏显示的字段 —— 顺序即显示顺序。
 # 用 FlowFrame 铺，窗口窄了会自动折行，不会丢字段。
 #
-# ⚠️ 实测坑：ro.build.display.id 在小米上是 **AOSP 构建号**（BP2A.250605.031.A3），
+# ⚠️ 实测坑：ro.build.display.id 在小米上是 **AOSP 构建号**（BP1A.240101.001），
 #    不是用户看到的系统版本号。真正的版本号在 ro.build.version.incremental
-#    （= OS3.0.307.0.WNKCNXM），也就是 DeviceInfo.version。
+#    （= OS1.0.1.0.ABCDEF），也就是 DeviceInfo.version。
 DEVICE_INFO_FIELDS = (
     "系统", "系统版本", "芯片", "平台", "内核", "架构",
     "内存", "屏幕", "槽位", "补丁", "Root",

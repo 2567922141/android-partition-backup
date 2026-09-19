@@ -605,7 +605,7 @@ class DeviceInfo:
 
     # ---- 详情字段（顶部设备信息栏用）----
     # 取不到一律留空串，界面显示 "—"。绝不为了好看去猜一个值。
-    build_id: str = ""          # ro.build.display.id（系统构建号，如 OS3.0.307.0.WNKCNXM）
+    build_id: str = ""          # ro.build.display.id（系统构建号，如 OS1.0.1.0.ABCDEF）
     security_patch: str = ""    # ro.build.version.security_patch
     soc_model: str = ""         # ro.soc.model（Android 12+ 才有）
     soc_maker: str = ""         # ro.soc.manufacturer

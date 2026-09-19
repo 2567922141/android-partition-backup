@@ -283,12 +283,12 @@ The window is four panels top to bottom, with **device info and the ADB switch r
 
 ```
 ① 设备状态 ──────────────────────────────────────────────────────────
-  ●  已连接  6f06de3d                          [刷新设备] [检查 Root]
+  ●  已连接  A1B2C3D4                          [刷新设备] [检查 Root]
      代号 vermeer · 识别为 高通 Qualcomm（得分 16） · root ✓ KernelSU
 
-  系统 Android 16（SDK 36）  系统版本 OS3.0.307.0.WNKCNXM
+  系统 Android 16（SDK 36）  系统版本 OS1.0.1.0.ABCDEF
   芯片 骁龙 8 Gen 2（SM8550）· 高通          平台 kalama
-  内核 5.15.194-android13-8-00019-gf4321180a397-ab15212794
+  内核 5.15.100-android13-8-00000-g0123456789ab-ab01234567
   架构 arm64-v8a             内存 14.8 GB      屏幕 1440x3200
   槽位 _a（当前系统槽）       补丁 2026-08-01   Root ✓ uid=0（u:r:ksu:s0）
 
@@ -320,7 +320,7 @@ is modified.
 | Field | Source | Notes |
 |---|---|---|
 | 系统 System | `ro.build.version.release` / `.sdk` | e.g. `Android 16（SDK 36）` |
-| 系统版本 OS build | `ro.build.version.incremental` | e.g. `OS3.0.307.0.WNKCNXM` |
+| 系统版本 OS build | `ro.build.version.incremental` | e.g. `OS1.0.1.0.ABCDEF` |
 | 芯片 Chip | `ro.soc.model` / `ro.soc.manufacturer` | authoritative on Android 12+ |
 | 平台 Platform | `ro.board.platform` | Qualcomm internal codename, e.g. `kalama` |
 | 内核 Kernel | `uname -r` | |
@@ -338,7 +338,7 @@ is modified.
 >
 > ⚠️ **"系统版本 / OS build" comes from `ro.build.version.incremental`, not
 > `ro.build.display.id`.** On Xiaomi/Redmi the latter is the **AOSP build ID**
-> (measured: `BP2A.250605.031.A3`), which is *not* the version shown under
+> (measured: `BP1A.240101.001`), which is *not* the version shown under
 > Settings → About phone — we got this wrong at first and only real-device
 > verification caught it. Likewise the kernel comes from `uname -r`: some ROMs
 > expose a two-component `ro.kernel.version` like `5.15`, and letting it win

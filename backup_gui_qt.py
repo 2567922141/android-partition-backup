@@ -649,6 +649,14 @@ class BackupApp:
         self._closing = False
         self._building = False
         self._suppress_item_changed = False
+        # 备份是否正在跑。**这是「任务进行中」的唯一权威标志** ——
+        # 以前各处零散地用 `self.worker and self.worker.is_alive()` 自己判断，
+        # 结果就是 A 处拦得住、B 处拦不住。统一收到这一个字段上。
+        self._task_busy = False
+        # 表格勾选框回滚期间的重入闩：回滚要调 setCheckState()，而它会再次
+        # 触发 itemChanged → 又进 _on_item_changed。没有这个闩就会：
+        # 弹一次窗 → 回滚 → 再弹一次窗 → 死循环。
+        self._guard_reverting = False
         self._srv_running = None
         self._srv_busy = False
         self._outdir = ""
@@ -970,6 +978,9 @@ class BackupApp:
             self._preset_buttons[p.key] = btn
             top.add(btn)
         self.preset_var = _ChoiceVar(self._preset_buttons, "critical+root")
+        # 「上一次真正生效的预设」。备份期间用户误点其它方案时要靠它回滚 ——
+        # 详见 _on_preset_toggled 里的信号顺序说明（回滚那一刻已经问不出旧值了）。
+        self._preset_prev = self.preset_var.get()
 
         # ---- 批量按钮 / 过滤 / 隐藏低价值 ----
         top2 = FlowWidget(f, gap=6, row_gap=6)
@@ -1169,13 +1180,20 @@ class BackupApp:
         self.srv_row.refresh()          # 文字变宽了要重新排
 
     def _toggle_server(self):
-        """启停 adb 服务端 —— 要跑 adb，所以放工作线程。"""
+        """启停 adb 服务端 —— 要跑 adb，所以放工作线程。
+
+        ⚠️ 备份期间**启和停都要拦**（原来只拦「停止」，用的是
+           `self.worker and self.worker.is_alive()`）。两个理由：
+             · 停：服务端一死，正在导出的分区立刻断流，备份直接失败。
+             · 启：`adb start-server` 会杀掉现存连接重建服务端，对正在跑的
+               导出同样是致命的。所以这里统一改用 self._task_busy 判断，
+               不再各处自己看 worker 线程活没活。
+        """
+        if self._guard_busy("启停 ADB 服务"):
+            return
         if self._srv_busy:
             return
         want_stop = bool(self._srv_running and self._srv_running[0])
-        if want_stop and self.worker and self.worker.is_alive():
-            self._mb_warn(APP_TITLE, "备份正在进行，不能停止 ADB 服务。")
-            return
         self._srv_busy = True
         self.btn_srv.setEnabled(False)
         self.btn_srv.setText("停止中" if want_stop else "启动中")
@@ -1383,6 +1401,8 @@ class BackupApp:
         return default_backup_root(here)
 
     def _reset_outdir(self):
+        if self._guard_busy("更改输出位置"):
+            return
         self.out_var.set(self._default_outdir())
         self._preview_path()
 
@@ -1407,7 +1427,15 @@ class BackupApp:
             self.lbl_preview.setText(f"（无法预览：{e}）")
             return
         arrow = "  ⟵  " + r.reason if r.collided else "  ⟵  该名称尚未使用"
-        self.lbl_preview.setText(r.path + arrow)
+        # ⚠️ 备份期间名称/根目录输入框仍然可编辑（**故意不弹窗** —— 绑定在
+        #    textChanged 上，敲一个字弹一次窗是灾难），但这样一来本标签算出来的
+        #    目录就可能和本次备份**真正**在写的目录不是同一个了。
+        #    那种情况下明说写入位置没变，别让用户以为改了个名字备份就换了地方。
+        note = ""
+        active = getattr(self, "_outdir", "")
+        if self._task_busy and active and os.path.normcase(r.path) != os.path.normcase(active):
+            note = f"　⚠️ 本次备份仍在写入：{active}"
+        self.lbl_preview.setText(r.path + arrow + note)
 
     @staticmethod
     def _log_level(text: str) -> str:
@@ -1478,7 +1506,53 @@ class BackupApp:
             self._color(self.lbl_result, COLOR_ERR)
         self.action_row.refresh()
 
+    # ------------------------------------------------------------------ 任务锁
+    def _guard_busy(self, what: str) -> bool:
+        """备份进行中就别让这些操作得逞 —— 返回 True 表示已经拦下并提示过。
+
+        ⚠️ 这里刻意**不禁用**控件，而是「保持可点、点了弹窗说原因」：
+           灰掉的按钮点不动也不解释，用户只会以为程序卡死了；弹窗能直接
+           告诉他「现在为什么不行、该怎么办」。
+           代价是每个入口都必须自己问一句 —— 所以所有危险操作的
+           **处理函数第一行**都要有它，而不是靠控件的 enabled 状态兜底。
+        """
+        if not self._task_busy:
+            return False
+        self._mb_warn(APP_TITLE, f"备份正在进行，暂时不能{what}。\n"
+                                 "请等它跑完，或先点「✕ 取消」。")
+        return True
+
+    def _set_task_busy(self, busy: bool):
+        """备份开始/结束时统一接管按钮可用性与状态栏。
+
+        只碰三个按钮：开始（忙时禁、闲时交回 _update_sum 判）、取消（反向）、
+        打开输出目录（反向）。其它控件按设计**始终可用**，靠 _guard_busy 拦。
+
+        忙时那句状态栏提示是必需的：控件没有变灰，用户唯一的线索就是这句话 ——
+        不然他得点了弹窗才知道「原来是备份在跑」。
+        """
+        self._task_busy = bool(busy)
+        if busy:
+            self.btn_start.setEnabled(False)
+            self.btn_cancel.setEnabled(True)
+            self.btn_open.setEnabled(False)
+            self._status("备份进行中 —— 相关设置已锁定（点击会提示原因）")
+        else:
+            self.btn_cancel.setEnabled(False)
+            self.btn_open.setEnabled(True)
+            # ⚠️ 绝不能无脑 setEnabled(True)：那样会让「设备未就绪也能开始
+            #    备份」这个 bug 复活。交回 _update_sum() 按设备/勾选/线程重新算。
+            self._update_sum()
+
     def _choose_out(self):
+        """挑一个备份根目录。
+
+        ⚠️ 备份期间拦下：目录一旦改掉，_preview_path() 显示的落点就与本次
+           备份**真正**在写的目录（self._outdir）对不上了 —— 用户会以为
+           备份跑到别处去了。
+        """
+        if self._guard_busy("更改输出位置"):
+            return
         d = QFileDialog.getExistingDirectory(
             self.window, "选择备份根目录", self.out_var.get() or os.getcwd())
         if d:
@@ -1545,6 +1619,14 @@ class BackupApp:
             time.sleep(1.5)
 
     def _force_refresh(self):
+        """重新探测设备。
+
+        ⚠️ 备份期间必须拦下：这个动作会把 self.adb / self.info 清成 None 并让
+           轮询线程重新跑一遍 `adb devices` + root 探测 —— 而工作线程此刻正在
+           用同一个 adb server 导出分区，两边抢 adb 是备份失败的经典原因。
+        """
+        if self._guard_busy("刷新设备"):
+            return
         self._last_devs = []
         self.lbl_dev.setText("正在检测设备 ...")
         self._color(self.lbl_dot, COLOR_DIM)
@@ -1552,6 +1634,8 @@ class BackupApp:
         self._status("已请求刷新")
 
     def _probe_now(self):
+        if self._guard_busy("检查 Root"):
+            return
         self._force_refresh()
 
     # ======================================================================
@@ -1646,17 +1730,93 @@ class BackupApp:
     #  分区列表
     # ======================================================================
 
+    def _mark_preset_custom(self):
+        """生效方案变成「自定义」（用户手动改了勾选）。
+
+        两个动作必须一起做，所以收成一个方法 —— 分散写迟早漏掉一个：
+          · preset_var 切到 "custom"（"自定义"按钮亮起，_ChoiceVar.get() 才有正确回读）
+          · _preset_prev 同步，"自定义"没有对应按钮，退不回它就会出现
+            「按钮显示 B、真正生效的是 custom」的假象。
+        """
+        self.preset_var.set("custom")
+        self._preset_prev = "custom"
+
     def _on_preset_toggled(self, checked: bool, key: str):
         """用户点了某个预设方案的单选按钮。
 
         对应 Tk 版 Radiobutton 的 command= —— Tk 只在**用户点击**时触发，
         程序里改变量不触发。所以建界面期间（_building）和取消选中都要忽略。
+
+        ⚠️ 备份期间要「拦下 + 回滚」。别的入口拦住就够了，这里不行：
+           单选按钮在 toggled 发出**之前**就已经自己选上了，光 return 会留下
+           「按钮显示 B 方案、真正在用的还是 A 方案」的假象。
+
+        ⚠️⚠️ 回滚必须依赖 _preset_prev，**不能**在 _restore_preset_visual()
+            里现找「哪个按钮还选着」。实测 Qt 的信号顺序是：
+                old.setChecked(False) → old.toggled(False)
+                new.setChecked(True)  → new.toggled(True)
+            也就是说同一次切换里 old 先变 False、new 后变 True，全部同步完成。
+            进入本函数时旧的已经灭了；此时 _ChoiceVar.get() 和「找另一个选中的
+            按钮」都会返回新的那个（或 None），旧方案再也查不回来，回滚必然失败。
+            所以「旧值」只能在 old.toggled(False) 那一次里提前记下来 ——
+            就是下面 checked=False 的那条分支。
         """
-        if not checked or self._building:
+        if self._building:
+            return
+        if not checked:
+            # Qt 取消旧按钮时也会发一次，但**不能在这里读 preset_var.get() 去记旧值**：
+            # 实测 Qt 是先改完两个按钮的 checked、再依次发信号，所以进到这里时
+            # preset_var.get() 已经是**新**方案了（拿它当旧值 → 回滚会「回滚到
+            # 刚被拦下的那个」，等于没回滚）。旧值只能由我们自己维护，见 _preset_prev。
             return
         if key == "custom":
+            # 手动改勾选框时 _on_item_changed 会把 preset_var 置 "custom"，
+            # 顺带同步 _preset_prev —— 这样后面误点别的方案能正确退回 custom。
+            self._preset_prev = "custom"
             return
+        if self._guard_reverting:
+            return
+        if self._task_busy:
+            self._mb_warn(APP_TITLE, "备份正在进行，暂时不能修改预设方案。\n"
+                                     "请等它跑完，或先点「✕ 取消」。")
+            self._restore_preset_visual()
+            return
+        self._preset_prev = key
         self._apply_preset()
+
+    def _restore_preset_visual(self):
+        """把预设方案的单选按钮退回到 _preset_prev 那个（备份期间用）。
+
+        要点：
+          · 必须**先**取消被误点的那个、**再**选回旧的。直接 setChecked(True)
+            选旧的，Qt 会自动把误点的那个取消掉 —— 顺序反了就白干。
+          · 整段 setChecked 都罩在 blockSignals 里，否则每一步都会发 toggled
+            → 又回到 _on_preset_toggled → 再弹一次窗。
+          · _guard_reverting 是第二道闩：万一信号没被完全挡住（比如按钮被塞进
+            了 QButtonGroup 之类的后续改动），也不会递归弹窗。
+          · ⚠️ _preset_prev 完全可能等于 "custom"（用户手动改过勾选框），
+            而 "custom" 是**没有对应按钮**的 —— 它的视觉表现就是「一个都没选」。
+            所以这里必须特判：custom 就全灭，绝不能拿别的方案顶替
+            （曾用 `or "critical+root"` 当兜底，结果把用户的 critical 悄悄
+            换成了 critical+root）。
+        """
+        prev = self._preset_prev
+        btns = list(self._preset_buttons.values())
+        self._guard_reverting = True
+        try:
+            for b in btns:
+                b.blockSignals(True)
+            try:
+                for b in btns:
+                    b.setChecked(False)
+                if prev in self._preset_buttons:
+                    self._preset_buttons[prev].setChecked(True)
+                # prev == "custom"（或任何不认识的键）→ 保持全灭，即 custom
+            finally:
+                for b in btns:
+                    b.blockSignals(False)
+        finally:
+            self._guard_reverting = False
 
     def _apply_preset(self):
         key = self.preset_var.get()
@@ -1734,29 +1894,54 @@ class BackupApp:
             f"（其中不可再生 {crit} 个）")
         ready = bool(self.adb and self.info and self.info.root_ok
                      and chosen and self.worker is None)
-        self.btn_start.setEnabled(bool(ready))
+        # ⚠️ 必须带上 `and not self._task_busy`。设备轮询线程在备份期间仍在跑
+        #    （只是 poll_paused 压着），它一旦喂来 "devices"/"info" 消息，
+        #    _on_devices()/_on_info() 就会走 _render_rows() → 本函数，把
+        #    「开始备份」重新点亮 —— 用户于是能点第二次备份，两个工作线程
+        #    同时抢 adb 和同一个输出目录。
+        self.btn_start.setEnabled(bool(ready) and not self._task_busy)
 
     # ---------------------------------------------------------- 交互
     def _on_item_changed(self, item, column):
-        """用户在表格里点了勾选框（对应 Tk 版的 _on_tree_click）。"""
-        if self._suppress_item_changed or column != 0:
+        """用户在表格里点了勾选框（对应 Tk 版的 _on_tree_click）。
+
+        ⚠️ 备份期间要「拦下 + 回滚勾选」，不能只 return：勾选框在 itemChanged
+           发出**之前**就已经变了，而真正决定备份清单的 self.checked 在下面几行
+           才更新 —— 只 return 就会留下「框是勾的、实际没备份」的假象。
+        """
+        if self._suppress_item_changed or self._guard_reverting or column != 0:
             return
         name = item.text(1)
         if not name:
+            return
+        if self._guard_busy("修改勾选"):
+            want = (Qt.CheckState.Checked if name in self.checked
+                    else Qt.CheckState.Unchecked)
+            if item.checkState(0) != want:
+                # 闩住重入：下面这句会同步再触发一次 itemChanged
+                self._guard_reverting = True
+                try:
+                    item.setCheckState(0, want)
+                finally:
+                    self._guard_reverting = False
             return
         if item.checkState(0) == Qt.CheckState.Checked:
             self.checked.add(name)
         else:
             self.checked.discard(name)
         self._update_sum()
-        self.preset_var.set("custom")
+        self._mark_preset_custom()
 
     def _on_space(self):
+        if self._guard_busy("修改勾选"):
+            return
         for item in self.tree.selectedItems():
             self._toggle_item(item)
         return
 
     def _toggle_item(self, item):
+        if self._guard_busy("修改勾选"):
+            return
         name = item.text(1)
         if not name:
             return
@@ -1772,9 +1957,12 @@ class BackupApp:
         finally:
             self._suppress_item_changed = False
         self._update_sum()
-        self.preset_var.set("custom")
+        self._mark_preset_custom()
 
     def _bulk(self, mode):
+        """批量勾选。备份期间拦下 —— 见 _guard_busy 的说明。"""
+        if self._guard_busy("修改勾选"):
+            return
         vis = self._visible()
         if mode == "all":
             self.checked |= {p.name for p in vis}
@@ -1789,7 +1977,7 @@ class BackupApp:
         elif mode == "critical":
             self.checked |= {p.name for p in vis if p.tier == 1}
         if mode != "critical":
-            self.preset_var.set("custom")
+            self._mark_preset_custom()
         self._render_rows()
 
     def _sort_by(self, section: int):
@@ -1914,11 +2102,11 @@ class BackupApp:
             name="backup", daemon=True)
         self.worker.start()
 
-        self.btn_start.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self.btn_open.setEnabled(False)
+        # 一次调用接管：开始/取消/打开输出目录 + 状态栏。状态栏那句由
+        # _set_task_busy() 统一给（「备份进行中 —— 相关设置已锁定…」），
+        # 这里不再单独 _status()，否则会把那句提示盖掉。
+        self._set_task_busy(True)
         self._set_result("")
-        self._status("备份进行中 ...")
 
     def _backup_worker(self, chosen, outdir, opts: EngineOptions, out_root: str):
         """
@@ -2088,9 +2276,10 @@ class BackupApp:
     def _on_done(self, r: dict):
         self.worker = None
         self.poll_paused.clear()
-        self.btn_start.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
-        self.btn_open.setEnabled(True)
+        # ⚠️ 必须在下面那些 return 之前调用：取消/失败/成功三条路径都要解锁，
+        #    漏掉任何一条，用户就会卡在「点什么都被拦」的状态里退不出来。
+        #    self.worker 也已在上一步置 None，_update_sum() 才能正确重算 btn_start。
+        self._set_task_busy(False)
         try:
             self.pb_item.setRange(0, 100)
             self.pb_item.setValue(100)
