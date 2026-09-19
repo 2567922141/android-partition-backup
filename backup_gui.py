@@ -37,6 +37,7 @@ from backup_core import (          # noqa: E402
     default_backup_root, resolve_backup_dir, sanitize_folder_name,
     write_device_marker, read_device_marker, DEFAULT_BACKUP_NAME,
     kill_live_children,
+    adb_server_running, adb_start_server, adb_stop_server,
 )
 from partition_profiles import (   # noqa: E402
     PRESETS, PRESET_EXCLUDE, PLATFORM_GENERIC, PROFILES_VERSION,
@@ -647,7 +648,94 @@ class BackupApp:
                                variable=self.opt_devverify))
         r4.add(ttk.Checkbutton(r4, text="失败自动回退", variable=self.opt_fallback))
 
+        # ---- ADB 服务 ----
+        # 服务端是**多个工具共用**的常驻进程（Android Studio / scrcpy 也在用
+        # 同一个）。所以这里给出显式开关，而退出时是否停掉交给用户勾选。
+        r5 = FlowFrame(f, gap=12, row_gap=6)
+        r5.pack(fill="x", pady=(10, 0))
+        self.srv_row = r5
+        self.lbl_srv = ttk.Label(r5, text="ADB 服务: 检测中 ...")
+        self.btn_srv = ttk.Button(r5, text="启动", width=8, command=self._toggle_server)
+        self.opt_killsrv = tk.BooleanVar(value=True)
+        r5.add(self.lbl_srv)
+        r5.add(self.btn_srv, gap=8)
+        r5.add(ttk.Checkbutton(r5, text="退出时停止 ADB 服务",
+                               variable=self.opt_killsrv), gap=16)
+        r5.add(ttk.Label(r5, text="（服务端是多个工具共用的常驻进程）",
+                         style="Sub.TLabel"), gap=6)
+        self._srv_running = None
+        self._srv_busy = False
+
         self.root.after(300, self._preview_path)
+        self.root.after(400, self._refresh_server_state)
+        self.root.after(2500, self._tick_server_state)
+
+    # ---------------------------------------------------------- ADB 服务
+    def _tick_server_state(self):
+        """每 2.5 秒看一眼 adb 服务端状态（别的程序也可能把它启停）。"""
+        if not self.poll_stop.is_set():
+            self._refresh_server_state()
+        self.root.after(2500, self._tick_server_state)
+
+    def _refresh_server_state(self):
+        """刷新「ADB 服务」那一行的显示。"""
+        if not hasattr(self, "lbl_srv") or self._srv_busy:
+            return
+        running = adb_server_running()
+        # 服务端被停掉时轮询也一定处于暂停 —— 把它体现在文字里，
+        # 否则用户会以为「设备检测坏了」。
+        paused = self.poll_paused.is_set() and not running
+        state = (running, paused)
+        if state == self._srv_running:
+            return                      # 没变就别白刷（省一次 refresh）
+        self._srv_running = state
+        if running:
+            self.lbl_srv.configure(text="ADB 服务: ● 运行中", foreground="#1a7f37")
+            self.btn_srv.configure(text="停止", state="normal")
+        else:
+            self.lbl_srv.configure(
+                text="ADB 服务: ○ 已停止" + ("（设备检测已暂停）" if paused else ""),
+                foreground="#b42318")
+            self.btn_srv.configure(text="启动", state="normal")
+        self.srv_row.refresh()          # 文字变宽了要重新排
+
+    def _toggle_server(self):
+        """启停 adb 服务端 —— 要跑 adb，所以放工作线程。"""
+        if self._srv_busy:
+            return
+        want_stop = bool(self._srv_running and self._srv_running[0])
+        if want_stop and self.worker and self.worker.is_alive():
+            messagebox.showwarning(APP_TITLE, "备份正在进行，不能停止 ADB 服务。")
+            return
+        self._srv_busy = True
+        self.btn_srv.configure(state="disabled",
+                               text="停止中" if want_stop else "启动中")
+        self.srv_row.refresh()
+
+        def work():
+            try:
+                if want_stop:
+                    # ⚠️ 必须先暂停设备轮询。否则轮询线程下一轮的 `adb devices`
+                    # 会立刻把服务端又拉起来 —— 用户看到的就是「点了停止没反应」。
+                    self.poll_paused.set()
+                    ok, msg = adb_stop_server(self.adb_path)
+                    verb = "停止" if ok else "停止失败"
+                    if not ok:
+                        self.poll_paused.clear()     # 没停成，把轮询放回去
+                else:
+                    ok, msg = adb_start_server(self.adb_path)
+                    verb = "启动" if ok else "启动失败"
+                    if ok:
+                        self.poll_paused.clear()
+                self.msg_q.put(("log", f"[ADB 服务] {verb}：{msg}"))
+            except Exception as e:
+                self.msg_q.put(("log", f"[ADB 服务] 操作异常：{e}"))
+            finally:
+                self._srv_busy = False
+                self._srv_running = None        # 强制下一轮重画
+                self.msg_q.put(("srv_changed", None))
+
+        threading.Thread(target=work, name="adb-server", daemon=True).start()
 
     # ---------------------------------------------------------- ④ 操作
     def _build_action_panel(self, parent):
@@ -929,6 +1017,8 @@ class BackupApp:
                     self._status(str(payload))
                 elif kind == "progress":
                     self._on_progress(payload)
+                elif kind == "srv_changed":
+                    self._refresh_server_state()
                 elif kind == "done":
                     self._on_done(payload)
         except queue.Empty:
@@ -1433,7 +1523,21 @@ class BackupApp:
         if leaked:
             self._log(f"[退出] 已回收 {leaked} 个仍在运行的 adb 子进程")
 
-        # ③ 等后台线程退出。这两个都是 daemon 线程，本来就会随进程结束 ——
+        # ③ 按用户勾选停掉 adb 服务端。
+        #    必须排在 ② 之后 —— 它自己也是一次 adb 调用，放前面会被刚装好的
+        #    清理逻辑误杀，服务端反而停不掉。
+        if self.opt_killsrv.get():
+            try:
+                ok, msg = adb_stop_server(self.adb_path)
+                self._log(f"[退出] 停止 ADB 服务：{'成功' if ok else '未成功'}（{msg}）")
+                self._drain_ui(0.05)
+            except Exception as e:
+                try:
+                    self._log(f"[退出] 停止 ADB 服务失败：{e}")
+                except Exception:
+                    pass
+
+        # ④ 等后台线程退出。这两个都是 daemon 线程，本来就会随进程结束 ——
         #    等它们只是为了收尾干净，所以上限给得很短，别让用户点完 X 还等。
         deadline = time.monotonic() + 0.6
         while time.monotonic() < deadline:

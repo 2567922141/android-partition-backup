@@ -296,6 +296,33 @@ No element is ever clipped — **at any window size, on any resolution, under an
 > **Why `grid` cannot be used either** — `grid` **shares column widths across the whole container**: after wrapping, a wide widget occupying column 0 widens that column, and **every other row shifts right as well**. Offsetting the column index by row number does not help, because row 1 still has to start after the columns used by row 0.
 > The final design is `FlowFrame` (computes its own wrapping coordinates) plus `ScrollHost` (scroll fallback).
 
+### ADB server switch
+
+The UI has a row: **`ADB 服务: ● 运行中  [停止]  ☑ 退出时停止 ADB 服务`**.
+
+| Control | What it does |
+|---|---|
+| Status text | Shows in real time whether the adb server is up (polled every 2.5 s via a millisecond-level port probe) |
+| `[启动]` / `[停止]` | Start or stop the adb server manually |
+| ☑ Exit-stop | **Checked by default** — runs `adb kill-server` when you close the window |
+
+**Why this switch exists** — the adb server (listening on `5037`) is a **shared** long-lived process (Android Studio and scrcpy use the very same one). This tool never kills it while running; it only stops it when you explicitly press "stop" or leave the exit-stop box checked.
+
+> ⚠️ **Pressing "stop" also pauses device detection** — otherwise the polling thread's next `adb devices` would immediately bring the server back up, and it would look like "stop does nothing". Press "start" to resume.
+
+#### What happens when you close the window
+
+```
+1. poll_stop.set()        tell background threads to stop issuing adb calls
+2. kill_live_children()   kill any adb child processes still running
+3. adb kill-server        stop the server if the box is checked (must come after 2)
+4. wait for threads (<=0.6s), then destroy()
+```
+
+> ❗ **Why it has to clean up after itself** — adb child processes are **separate processes**; Python exiting does not take them along. If an adb call is in flight when you close the window (device polling, reading the partition table, or a backup in progress), that `adb.exe` becomes an orphan left behind in Task Manager.
+> Measured (Windows / Python 3.14): after `Popen(["adb","wait-for-device"])`, letting the interpreter exit leaves that adb process **still alive**.
+> In the implementation, `backup_core.py` keeps a child-process registry: all seven `subprocess.run` calls go through `_run()` (which registers the PID), the two `Popen` sites were given registration too, and an `atexit` hook acts as a backstop — so no exit path can leave an orphan.
+
 ## 7. FAQ
 
 ### "No device detected"
@@ -383,7 +410,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Version | Changes |
 |---|---|
-| **1.1.1** | **Fixed UI elements being hidden after resizing the window** — replaced with a responsive layout: automatic reflow of horizontal rows, scrollable-canvas fallback, window size measured from the screen |
+| **1.1.1** | **New: ADB server switch** (start/stop manually, plus automatic stop on exit); **fixed `adb.exe` becoming an orphan process after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame); **fixed UI elements being hidden after resizing the window** — replaced with a responsive layout: automatic reflow of horizontal rows, scrollable-canvas fallback, window size measured from the screen |
 | 1.1.0 | Fixed all six LUNs' GPT tail backups failing (a local path was used as a device path); fixed the byte stream being polluted by stderr; fixed two whitelist validation gaps |
 
 ---

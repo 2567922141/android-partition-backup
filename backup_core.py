@@ -27,9 +27,11 @@
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import os
 import re
+import socket
 import subprocess
 import sys
 import tarfile
@@ -137,6 +139,74 @@ def _run(cmd, timeout=None, check=False, **kw):
     if check and p.returncode != 0:
         raise subprocess.CalledProcessError(p.returncode, cmd, out, err)
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+# adb 服务端默认端口。它是**多个工具共用**的常驻进程，不是本程序私有的，
+# 所以本程序只在自己退出时按用户意愿把它停掉，绝不在运行期间擅自杀它。
+ADB_SERVER_PORT = 5037
+
+
+def adb_server_running(port: int = ADB_SERVER_PORT) -> bool:
+    """adb 服务端在不在跑 —— 看 5037 端口有没有人监听。
+
+    比跑 `adb start-server` 去探测快得多（毫秒级 vs 几百毫秒），
+    也不会产生副作用。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.35)
+    try:
+        s.connect(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def adb_start_server(adb_path: str, timeout: int = 30) -> tuple[bool, str]:
+    """启动 adb 服务端。返回 (是否成功, 说明文字)。"""
+    if not adb_path:
+        return False, "未找到 adb.exe"
+    try:
+        p = _run([adb_path, "start-server"], stdout=subprocess.PIPE,
+                 stderr=subprocess.STDOUT, creationflags=_CREATE_NO_WINDOW,
+                 timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"启动超时（{timeout} 秒）"
+    except OSError as e:
+        return False, f"无法执行 adb: {e}"
+    text = (p.stdout or b"").decode("utf-8", "replace").strip()
+    ok = adb_server_running()
+    return ok, (text or ("已启动" if ok else "启动后仍未监听 5037"))
+
+
+def adb_stop_server(adb_path: str, timeout: int = 20) -> tuple[bool, str]:
+    """停止 adb 服务端。返回 (是否已停止, 说明文字)。
+
+    ⚠️ 这会影响到**其它**正在用 adb 的程序（Android Studio、scrcpy 等）。
+    所以只在用户明确要求时调用。
+    """
+    if not adb_path:
+        return True, "未找到 adb.exe，无需停止"
+    try:
+        p = _run([adb_path, "kill-server"], stdout=subprocess.PIPE,
+                 stderr=subprocess.STDOUT, creationflags=_CREATE_NO_WINDOW,
+                 timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"停止超时（{timeout} 秒）"
+    except OSError as e:
+        return False, f"无法执行 adb: {e}"
+    text = (p.stdout or b"").decode("utf-8", "replace").strip()
+    gone = not adb_server_running()
+    return gone, (text or ("已停止" if gone else "仍在监听 5037"))
+
+
+# 兜底：无论从哪条路径退出（GUI 关窗、CLI 跑完、异常退出），
+# 都不要把 adb 子进程留在任务管理器里。
+atexit.register(kill_live_children, 0.5)
 # 分区名：首字符必须是字母/数字/下划线 —— 这样 "." 与 ".." 会被直接拒绝。
 # （真实分区名如 persist / modemst1 / init_boot_a / vbmeta_system_a 都满足）
 _PART_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}$")
