@@ -230,7 +230,7 @@ Measured data (a 32 MB persist partition):
 
 ---
 
-## 6. Progress Display
+## 6. Interface and Progress Display
 
 ### GUI
 
@@ -280,6 +280,21 @@ In the terminal it is a single-line refreshing progress bar (`\r` overwrite, no 
 `\r` characters are not stuffed into the log file. Add `--quiet` to turn progress output off entirely.
 
 ---
+
+### Responsive layout (window resizing)
+
+No element is ever clipped — **at any window size, on any resolution, under any DPI scaling**.
+
+| Mechanism | What it solves |
+|---|---|
+| **Window size measured from content and screen** | No more hard-coded `1060x820`. On startup the real content requirement is measured, then clamped to the available screen area |
+| **Scrollable canvas as a safety net** | When the window is smaller than the content, a scrollbar appears so every control stays reachable |
+| **Automatic reflow of horizontal rows** | Presets, bulk-action buttons and option switches wrap onto the next line in a narrow window instead of being pushed out of view |
+| **Dual scrollbars on the table and the log** | In a narrow window you can scroll horizontally, so columns and long log lines are never cut off |
+
+> **Why `pack(side="left")` cannot be used** — when the container is too narrow, `pack` pushes the **later widgets straight out of the visible area**, with no error and no warning. The symptom is "some buttons disappear after I make the window narrower".
+> **Why `grid` cannot be used either** — `grid` **shares column widths across the whole container**: after wrapping, a wide widget occupying column 0 widens that column, and **every other row shifts right as well**. Offsetting the column index by row number does not help, because row 1 still has to start after the columns used by row 0.
+> The final design is `FlowFrame` (computes its own wrapping coordinates) plus `ScrollHost` (scroll fallback).
 
 ## 7. FAQ
 
@@ -358,11 +373,18 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Item | Value |
 |---|---|
-| Tool version | 1.1.0 |
+| Tool version | **1.1.1** |
 | Core version | 1.0.0 |
 | Profile library version | 1.0.0 |
 | Dependencies | Python standard library only (tkinter), **zero third-party packages** |
 | Portable package size | About 50 MB (including the Python runtime + ADB)|
+
+### Changelog
+
+| Version | Changes |
+|---|---|
+| **1.1.1** | **Fixed UI elements being hidden after resizing the window** — replaced with a responsive layout: automatic reflow of horizontal rows, scrollable-canvas fallback, window size measured from the screen |
+| 1.1.0 | Fixed all six LUNs' GPT tail backups failing (a local path was used as a device path); fixed the byte stream being polluted by stderr; fixed two whitelist validation gaps |
 
 ---
 

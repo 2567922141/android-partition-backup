@@ -5,10 +5,10 @@
 ================================================================================
   产出两个 zip，覆盖「目标电脑有没有 Python」两种情况：
 
-     ① android-partition-backup-v1.1.0-portable.zip
+     ① android-partition-backup-v1.1.1-portable.zip
         含 Python 运行时 + ADB。任何 Windows 10/11 x64 解压即用，零依赖。
 
-     ② android-partition-backup-v1.1.0-script.zip
+     ② android-partition-backup-v1.1.1-script.zip
         只有 .py + ADB。适合本机已装 Python 的场景，体积小一个数量级。
 
   用法： powershell -ExecutionPolicy Bypass -File _build_release.ps1
@@ -24,7 +24,7 @@ $ToolDir = if ((Split-Path $Here -Leaf) -eq "tools") { Split-Path $Here -Parent 
 $WsRoot  = Split-Path $ToolDir -Parent
 $PortDir = Join-Path $WsRoot "android-partition-backup-portable"      # 已构建好的便携版
 $RelDir  = Join-Path $WsRoot "发布包"
-$Ver     = "1.1.0"
+$Ver     = "1.1.1"
 
 function Say($m, $c = "Gray") { Write-Host $m -ForegroundColor $c }
 function MB($p) {

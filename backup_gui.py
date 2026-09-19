@@ -43,7 +43,7 @@ from partition_profiles import (   # noqa: E402
 )
 
 APP_TITLE = "安卓分区备份工具"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 
 CHECK_ON = "☑"
 CHECK_OFF = "☐"
@@ -113,6 +113,223 @@ def enable_dpi_awareness():
 
 
 # ==============================================================================
+#  响应式布局构件
+# ==============================================================================
+
+#: 期望窗口尺寸（屏幕够大时用这个）
+DEF_W, DEF_H = 1060, 900
+#: 允许缩到的最小尺寸。比这更小也不会丢控件 —— 滚动条会接管（见 ScrollHost）
+MIN_W, MIN_H = 760, 520
+
+
+class FlowFrame(ttk.Frame):
+    """一排控件，窗口变窄时自动折行。
+
+    【为什么不能用 pack(side="left")】
+        pack 在容器宽度不足时，会把**排在后面的控件直接挤出可视区**，
+        既不报错也不提示 —— 这就是「调整窗口大小后有些元素消失」的根因。
+
+    【为什么也不能用 grid】
+        grid 的列宽是**整个容器共享**的：折行后若某一行的宽控件占了第 0 列，
+        这一列就会被撑宽，**其它行也跟着右移**。把列号按行号错开也没用 ——
+        第 1 行仍然要排在第 0 行那些列之后（实测越界 142px）。
+        所以这里用 place 自己算坐标，各行完全独立。
+
+    用法::
+
+        row = FlowFrame(parent)
+        row.pack(fill="x")
+        row.add(ttk.Button(row, text="全选", command=...))
+        row.add(ttk.Button(row, text="反选", command=...), gap=14)
+
+    注意：控件必须用本行的对象做 parent（`ttk.Button(row, ...)`）。
+    """
+
+    def __init__(self, master, gap=10, row_gap=6, **kw):
+        super().__init__(master, **kw)
+        self._gap = gap           # 同一行内相邻控件的间距
+        self._row_gap = row_gap   # 折行后行与行之间的竖直间距
+        self._items = []          # [(widget, gap_before)]
+        self._last_w = -1
+        self.bind("<Configure>", self._on_configure)
+
+    def add(self, widget, gap=None):
+        """把控件登记进本行 —— 由本行统一负责它的位置。"""
+        self._items.append((widget, self._gap if gap is None else gap))
+        self._last_w = -1
+        self.after_idle(self._reflow)
+        return widget
+
+    def add_all(self, widgets, gap=None):
+        for w in widgets:
+            self.add(w, gap)
+        return widgets
+
+    def refresh(self):
+        """子控件文本变了（宽度随之变化）之后重新测量排布。"""
+        self._last_w = -1
+        self._reflow()
+
+    def _on_configure(self, event):
+        # 宽度变了才重排；高度变化不处理（否则会自己触发自己）
+        if abs(event.width - self._last_w) >= 2:
+            self._last_w = event.width
+            self._reflow(event.width)
+
+    def _reflow(self, width=None):
+        if not self._items:
+            return
+        if width is None:
+            width = self.winfo_width()
+        if width <= 1:
+            # 还没映射 —— 先摆成一行，等真正的 <Configure> 再折
+            width = (sum(w.winfo_reqwidth() for w, _ in self._items)
+                     + self._gap * max(0, len(self._items) - 1))
+
+        x = y = 0
+        row_h = 0
+        for w, gap in self._items:
+            need = w.winfo_reqwidth()
+            h = max(w.winfo_reqheight(), 1)
+            g = 0 if x == 0 else gap
+            if x > 0 and x + g + need > width:
+                y += row_h + self._row_gap     # 放不下 → 换行
+                x = 0
+                g = 0
+                row_h = 0
+            w.place(x=x + g, y=y, width=need, height=h)
+            x += g + need
+            row_h = max(row_h, h)
+        # place 不会把尺寸传给父容器，高度得自己报
+        total = y + row_h
+        if total != self.winfo_reqheight():
+            self.configure(height=total)
+
+
+class ScrollHost(ttk.Frame):
+    """把整个界面装进一个可滚动画布 —— 「绝不丢控件」的兜底保险。
+
+    两种情形都照顾到：
+
+    * 窗口比内容**大** → 内容撑满画布，`expand=True` 的区块（分区表、日志）
+      自动吃掉多余空间；
+    * 窗口比内容**小** → 出现竖直滚动条，任何元素都够得着。
+      哪怕在 1366x768 的老笔记本上、或者系统 DPI 放大到 200%，
+      也不会有控件被永久裁掉。
+
+    滚动条只在真正需要时才出现（内容比画布高）。
+    """
+
+    def __init__(self, master, **kw):
+        super().__init__(master, **kw)
+        bg = "SystemButtonFace"
+        try:
+            bg = ttk.Style().lookup("TFrame", "background") or bg
+        except Exception:
+            pass
+
+        self.canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0,
+                                background=bg)
+        self.vsb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vsb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner = ttk.Frame(self.canvas)
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self._sb_visible = False
+        self._win_h = -1        # 上次给内容区设定的高度（防重复设置引发循环）
+
+        self.inner.bind("<Configure>", self._on_inner)
+        self.canvas.bind("<Configure>", self._on_canvas)
+
+    # ---------------------------------------------------------------- 内部
+    def _on_inner(self, _event=None):
+        """内容区尺寸变了。
+
+        注意：这里**必须**重新应用一次高度。原因：画布 resize 时算出的
+        reqheight 可能已经过期 —— FlowFrame 的折行是在那之后才发生的，
+        折行会改变内容高度。只靠 canvas 的 <Configure> 会留下错误的高度。
+        """
+        self._apply_height()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._sync_scrollbar()
+
+    def _on_canvas(self, event):
+        # 宽度跟随画布（这样内部的 flow / expand 才有正确的参考宽度）
+        if event.width != getattr(self, "_win_w", -1):
+            self._win_w = event.width
+            self.canvas.itemconfigure(self._win, width=event.width)
+        self._relayout_pending = False
+        self._apply_height()
+        self._sync_scrollbar()
+        # ⚠️ 折行发生在这一切**之后**，而 inner 的尺寸若没变就不会再触发
+        # <Configure> —— 于是高度会永远停在按旧 reqheight 算出的值，
+        # 末尾的状态栏就再也映射不出来了。补几轮 idle 重算（每轮很便宜），
+        # 等布局彻底稳定。用 pending 标志避免重复排队。
+        if not self._relayout_pending:
+            self._relayout_pending = True
+            self.after_idle(lambda: self._relayout(8))
+
+    def _relayout(self, budget=0):
+        if budget <= 0:
+            self._relayout_pending = False
+            return
+        self._apply_height()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._sync_scrollbar()
+        self.after_idle(lambda: self._relayout(budget - 1))
+
+    def _apply_height(self):
+        """内容区高度 = max(画布高度, 内容需求高度)。
+
+        * 内容矮 → 撑满画布，让 `expand=True` 的区块（分区表、日志）长大
+        * 内容高 → 保持需求高度，交给滚动条
+        """
+        ch = self.canvas.winfo_height()
+        if ch <= 1:
+            return                      # 还没映射，别下结论
+        want = max(ch, self.inner.winfo_reqheight())
+        if want != self._win_h:
+            self._win_h = want
+            self.canvas.itemconfigure(self._win, height=want)
+
+    def _sync_scrollbar(self):
+        """按需显隐竖滚动条。
+
+        不会来回抖动：藏起来 → 画布变宽 → 内容只会更矮或不变；
+        亮出来 → 画布变窄 → 内容只会更高或不变。两个方向都是单调的。
+        """
+        if self.canvas.winfo_height() <= 1:
+            return
+        need = self.inner.winfo_reqheight() > self.canvas.winfo_height() + 1
+        if need == self._sb_visible:
+            return
+        self._sb_visible = need
+        if need:
+            self.vsb.pack(side="right", fill="y")
+        else:
+            self.vsb.pack_forget()
+
+    def _on_wheel(self, event):
+        if not self._sb_visible:
+            return
+        self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def bind_wheel(self, widget=None):
+        """给内容区挂滚轮事件。
+
+        表格（Treeview）与日志（Text）自带滚动，跳过 —— 否则滚轮会同时
+        滚它们和整个页面，手感很怪。
+        """
+        widget = widget if widget is not None else self.inner
+        if isinstance(widget, (ttk.Treeview, tk.Text)):
+            return
+        widget.bind("<MouseWheel>", self._on_wheel, add="+")
+        for child in widget.winfo_children():
+            self.bind_wheel(child)
+
+
+# ==============================================================================
 #  主窗口
 # ==============================================================================
 
@@ -169,11 +386,12 @@ class BackupApp:
     # ------------------------------------------------------------------ 布局
     def _build_ui(self):
         self.root.title(f"{APP_TITLE} v{APP_VERSION}")
-        self.root.geometry("1060x820")
-        self.root.minsize(900, 700)
-        self._center()
 
-        outer = ttk.Frame(self.root, padding=10)
+        # 整个界面装进可滚动画布 —— 窗口再小也不会把控件裁掉
+        self.host = ScrollHost(self.root)
+        self.host.pack(fill="both", expand=True)
+
+        outer = ttk.Frame(self.host.inner, padding=10)
         outer.pack(fill="both", expand=True)
 
         self._build_device_panel(outer)
@@ -183,12 +401,36 @@ class BackupApp:
         self._build_progress_panel(outer)
         self._build_statusbar(outer)
 
-    def _center(self):
+        self.host.bind_wheel()
+        # 等所有控件算出自然尺寸后再定窗口大小，否则量到的是半成品
+        self.root.after_idle(self._fit_window)
+
+    def _fit_window(self):
+        """按「内容实际需求」和「屏幕可用区」决定初始窗口大小。
+
+        旧版写死 `geometry("1060x820")` + `minsize(900, 700)`：
+        一旦系统 DPI 放大、或字体与内容变多，实际需要的尺寸就会超过 820，
+        而 pack 在空间不足时是**从末尾开始裁**的 —— 状态栏、进度条、日志
+        依次消失，且不给任何提示。这里改成实测后按需取值。
+        """
         self.root.update_idletasks()
-        w, h = 1060, 820
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        self.root.geometry(f"{w}x{h}+{max(0,(sw-w)//2)}+{max(0,(sh-h)//2-20)}")
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+
+        need_w = self.host.inner.winfo_reqwidth() + 4
+        need_h = self.host.inner.winfo_reqheight() + 4
+
+        max_w = max(MIN_W, sw - 40)      # 给窗口边框留余量
+        max_h = max(MIN_H, sh - 90)      # 给任务栏和标题栏留余量
+        w = min(max(need_w, DEF_W), max_w)
+        h = min(max(need_h, DEF_H), max_h)
+
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2 - 20)
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+
+        # 最小尺寸故意允许小于内容 —— 那种情况下滚动条接管，元素依然够得着，
+        # 比「锁死一个很大的 minsize 导致小屏上窗口超出屏幕」要好得多。
+        self.root.minsize(min(MIN_W, max_w), min(MIN_H, max_h))
 
     # ---------------------------------------------------------- ① 设备状态
     def _build_device_panel(self, parent):
@@ -219,58 +461,62 @@ class BackupApp:
         f = ttk.LabelFrame(parent, text=" ② 选择要备份的分区 ", padding=10)
         f.pack(fill="both", expand=True, pady=(0, 8))
 
-        top = ttk.Frame(f)
+        top = FlowFrame(f, gap=8)
         top.pack(fill="x", pady=(0, 6))
-        ttk.Label(top, text="预设方案:").pack(side="left")
+        top.add(ttk.Label(top, text="预设方案:"))
         self.preset_var = tk.StringVar(value="critical+root")
         for p in PRESETS:
-            ttk.Radiobutton(top, text=p.display, value=p.key, variable=self.preset_var,
-                            command=self._apply_preset).pack(side="left", padx=(8, 0))
+            top.add(ttk.Radiobutton(top, text=p.display, value=p.key,
+                                    variable=self.preset_var,
+                                    command=self._apply_preset))
 
-        top2 = ttk.Frame(f)
+        top2 = FlowFrame(f, gap=6, row_gap=6)
         top2.pack(fill="x", pady=(0, 6))
-        ttk.Button(top2, text="全选", width=6,
-                   command=lambda: self._bulk("all")).pack(side="left", padx=(0, 4))
-        ttk.Button(top2, text="全不选", width=7,
-                   command=lambda: self._bulk("none")).pack(side="left", padx=(0, 4))
-        ttk.Button(top2, text="反选", width=6,
-                   command=lambda: self._bulk("invert")).pack(side="left", padx=(0, 4))
-        ttk.Button(top2, text="仅不可再生", width=11,
-                   command=lambda: self._bulk("critical")).pack(side="left", padx=(0, 12))
+        top2.add(ttk.Button(top2, text="全选", width=6,
+                            command=lambda: self._bulk("all")))
+        top2.add(ttk.Button(top2, text="全不选", width=7,
+                            command=lambda: self._bulk("none")))
+        top2.add(ttk.Button(top2, text="反选", width=6,
+                            command=lambda: self._bulk("invert")))
+        top2.add(ttk.Button(top2, text="仅不可再生", width=11,
+                            command=lambda: self._bulk("critical")), gap=14)
 
-        ttk.Label(top2, text="过滤:").pack(side="left")
+        top2.add(ttk.Label(top2, text="过滤:"), gap=14)
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_: self._render_rows())
-        e = ttk.Entry(top2, textvariable=self.filter_var, width=18)
-        e.pack(side="left", padx=4)
+        top2.add(ttk.Entry(top2, textvariable=self.filter_var, width=18))
 
         self.hide_low = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top2, text="隐藏低价值分区", variable=self.hide_low,
-                        command=self._render_rows).pack(side="left", padx=(12, 0))
-
-        ttk.Label(top2, text="（勾选/取消：点击左侧方框，或选中行按空格）",
-                  style="Sub.TLabel").pack(side="right")
+        top2.add(ttk.Checkbutton(top2, text="隐藏低价值分区", variable=self.hide_low,
+                                 command=self._render_rows), gap=14)
+        top2.add(ttk.Label(top2, text="（勾选/取消：点击左侧方框，或选中行按空格）",
+                           style="Sub.TLabel"), gap=14)
 
         # ---- 表格 ----
         wrap = ttk.Frame(f)
         wrap.pack(fill="both", expand=True)
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
 
         cols = ("chk", "name", "size", "tier", "note")
         self.tree = ttk.Treeview(wrap, columns=cols, show="headings",
-                                 selectmode="extended")
+                                 selectmode="extended", height=6)
         heads = [("chk", "选", 44, "center"), ("name", "分区名", 210, "w"),
                  ("size", "大小", 100, "e"), ("tier", "级别", 100, "center"),
                  ("note", "说明", 520, "w")]
         for key, text, width, anchor in heads:
             self.tree.heading(key, text=text,
                               command=lambda k=key: self._sort_by(k))
-            self.tree.column(key, width=width, anchor=anchor,
+            self.tree.column(key, width=width, anchor=anchor, minwidth=60,
                              stretch=(key == "note"))
 
+        # 竖直 + 水平双滚动条：窗口很窄时横向可以拖，列不会被切掉
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vsb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
+        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
 
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<space>", self._on_space)
@@ -316,36 +562,38 @@ class BackupApp:
         self.lbl_preview.pack(side="left", fill="x", expand=True)
 
         # ---- 开关 ----
-        r4 = ttk.Frame(f)
+        r4 = FlowFrame(f, gap=14, row_gap=6)
         r4.pack(fill="x")
         self.opt_gpt = tk.BooleanVar(value=True)
         self.opt_env = tk.BooleanVar(value=False)
         self.opt_devverify = tk.BooleanVar(value=False)
         self.opt_fallback = tk.BooleanVar(value=True)
 
-        ttk.Checkbutton(r4, text="备份 GPT 分区表", variable=self.opt_gpt).pack(side="left")
-        ttk.Checkbutton(r4, text="打包 /data/adb 环境", variable=self.opt_env).pack(side="left", padx=(14, 0))
-        ttk.Checkbutton(r4, text="设备端二次校验（慢，最严格）",
-                        variable=self.opt_devverify).pack(side="left", padx=(14, 0))
-        ttk.Checkbutton(r4, text="失败自动回退", variable=self.opt_fallback).pack(side="left", padx=(14, 0))
+        r4.add(ttk.Checkbutton(r4, text="备份 GPT 分区表", variable=self.opt_gpt))
+        r4.add(ttk.Checkbutton(r4, text="打包 /data/adb 环境", variable=self.opt_env))
+        r4.add(ttk.Checkbutton(r4, text="设备端二次校验（慢，最严格）",
+                               variable=self.opt_devverify))
+        r4.add(ttk.Checkbutton(r4, text="失败自动回退", variable=self.opt_fallback))
 
         self.root.after(300, self._preview_path)
 
     # ---------------------------------------------------------- ④ 操作
     def _build_action_panel(self, parent):
-        f = ttk.Frame(parent)
+        f = FlowFrame(parent, gap=8, row_gap=8)
+        self.action_row = f
         f.pack(fill="x", pady=(0, 8))
         self.btn_start = ttk.Button(f, text="▶  开始备份", style="Big.TButton",
                                     command=self._start_backup, state="disabled")
-        self.btn_start.pack(side="left")
+        f.add(self.btn_start)
         self.btn_cancel = ttk.Button(f, text="✕  取消", style="Big.TButton",
                                      command=self._cancel_backup, state="disabled")
-        self.btn_cancel.pack(side="left", padx=8)
+        f.add(self.btn_cancel)
         self.btn_open = ttk.Button(f, text="打开输出目录", command=self._open_outdir,
                                    state="disabled")
-        self.btn_open.pack(side="left", padx=8)
+        f.add(self.btn_open, gap=10)
+
         self.lbl_result = ttk.Label(f, text="", font=(self.font, 11, "bold"))
-        self.lbl_result.pack(side="right")
+        f.add(self.lbl_result, gap=14)
 
     # ---------------------------------------------------------- ⑤ 进度
     def _build_progress_panel(self, parent):
@@ -353,37 +601,46 @@ class BackupApp:
         f.pack(fill="both", expand=True)
 
         # ---- 当前分区 ----
+        # 标签宽度刻意收窄：两个 34 字符宽的标签在窄窗口里会把进度条挤没
         r1 = ttk.Frame(f)
         r1.pack(fill="x")
-        self.lbl_cur = ttk.Label(r1, text="就绪", width=24, anchor="w")
+        self.lbl_cur = ttk.Label(r1, text="就绪", width=16, anchor="w")
         self.lbl_cur.pack(side="left")
         self.pb_item = ttk.Progressbar(r1, mode="determinate", maximum=100)
         self.pb_item.pack(side="left", fill="x", expand=True, padx=8)
-        self.lbl_item_pct = ttk.Label(r1, text="", width=34, anchor="e",
+        self.lbl_item_pct = ttk.Label(r1, text="", width=36, anchor="e",
                                       font=("Consolas", 9))
         self.lbl_item_pct.pack(side="left")
 
         # ---- 总计 ----
         r2 = ttk.Frame(f)
         r2.pack(fill="x", pady=(4, 8))
-        self.lbl_all_name = ttk.Label(r2, text="总计", width=24, anchor="w")
+        self.lbl_all_name = ttk.Label(r2, text="总计", width=16, anchor="w")
         self.lbl_all_name.pack(side="left")
         self.pb_all = ttk.Progressbar(r2, mode="determinate", maximum=100)
         self.pb_all.pack(side="left", fill="x", expand=True, padx=8)
-        self.lbl_all_pct = ttk.Label(r2, text="", width=34, anchor="e",
+        self.lbl_all_pct = ttk.Label(r2, text="", width=36, anchor="e",
                                      font=("Consolas", 9))
         self.lbl_all_pct.pack(side="left")
 
         # ---- 日志 ----
         wrap = ttk.Frame(f)
         wrap.pack(fill="both", expand=True)
-        self.log = tk.Text(wrap, height=11, wrap="none", font=("Consolas", 9),
+        wrap.rowconfigure(0, weight=1)
+        wrap.columnconfigure(0, weight=1)
+        # height 只作为**自然高度下限**；窗口变大时靠 expand 长高，
+        # 窗口变小时由 ScrollHost 兜底。故意取小 —— 自然高度越小，
+        # 小屏幕上「一打开就全都看得见」的概率越高。
+        self.log = tk.Text(wrap, height=5, wrap="none", font=("Consolas", 9),
                            background="#1e1e1e", foreground="#d4d4d4",
                            insertbackground="#d4d4d4", padx=6, pady=4)
         lsb = ttk.Scrollbar(wrap, orient="vertical", command=self.log.yview)
-        self.log.configure(yscrollcommand=lsb.set, state="disabled")
-        self.log.pack(side="left", fill="both", expand=True)
-        lsb.pack(side="right", fill="y")
+        hsb = ttk.Scrollbar(wrap, orient="horizontal", command=self.log.xview)
+        self.log.configure(yscrollcommand=lsb.set, xscrollcommand=hsb.set,
+                           state="disabled")
+        self.log.grid(row=0, column=0, sticky="nsew")
+        lsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
 
         # 日志分级着色 —— 一眼能从瀑布里挑出失败项
         self.log.tag_configure("head", foreground="#c586c0",
@@ -493,6 +750,18 @@ class BackupApp:
 
     def _status(self, text: str):
         self.lbl_status.configure(text=text)
+
+    def _set_result(self, text: str, style: str = ""):
+        """更新底部结果标签。
+
+        文本宽度会变（"" → "✅ 全部通过 13/13"），而 FlowFrame 用的是绝对
+        定位、不会自动重排，所以必须主动 refresh 一次。
+        """
+        if style:
+            self.lbl_result.configure(text=text, style=style)
+        else:
+            self.lbl_result.configure(text=text)
+        self.action_row.refresh()
 
     def _choose_out(self):
         d = filedialog.askdirectory(title="选择备份根目录",
@@ -874,7 +1143,7 @@ class BackupApp:
         self.btn_start.configure(state="disabled")
         self.btn_cancel.configure(state="normal")
         self.btn_open.configure(state="disabled")
-        self.lbl_result.configure(text="")
+        self._set_result("")
         self._status("备份进行中 ...")
 
     def _backup_worker(self, chosen, outdir, opts: EngineOptions, out_root: str):
@@ -966,9 +1235,10 @@ class BackupApp:
             spd = self._meter.sample(cur, time.time())
             eta = self._meter.eta(cur, exp)
             self.lbl_cur.configure(text=name)
+            # 紧凑写法：两个标签都是 36 列宽，原来的 " / " 与 " MB/s " 会超出被截断
             self.lbl_item_pct.configure(
-                text=f"{human_size(cur)} / {human_size(exp)}   "
-                     f"{spd / 1048576:5.1f} MB/s   剩 {human_duration(eta)}")
+                text=f"{human_size(cur)}  {spd / 1048576:.1f}MB/s  "
+                     f"剩{human_duration(eta)}")
             self._update_overall(cur)
 
         elif phase == "hash":
@@ -1000,8 +1270,8 @@ class BackupApp:
         ospd = (overall / el) if el > 0 else 0.0
         oeta = ((total - overall) / ospd) if ospd > 0 else None
         self.lbl_all_pct.configure(
-            text=f"{human_size(overall)} / {human_size(total)}   "
-                 f"{ospd / 1048576:5.1f} MB/s   剩 {human_duration(oeta)}")
+            text=f"{human_size(overall)}/{human_size(total)}  "
+                 f"{ospd / 1048576:.1f}MB/s  剩{human_duration(oeta)}")
         # 窗口最小化 / 被遮挡时，任务栏上也能看到进度
         self.root.title(f"{APP_TITLE} — 备份中 {pct:.0f}%")
 
@@ -1024,11 +1294,11 @@ class BackupApp:
             self.root.title(f"{APP_TITLE} v{APP_VERSION}")
 
         if r.get("cancelled"):
-            self.lbl_result.configure(text="已取消", style="Warn.TLabel")
+            self._set_result("已取消", "Warn.TLabel")
             self._status("备份已取消")
             return
         if not r.get("ok"):
-            self.lbl_result.configure(text="失败", style="Err.TLabel")
+            self._set_result("失败", "Err.TLabel")
             self._status(f"备份失败：{r.get('error','未知错误')}")
             messagebox.showerror(APP_TITLE, f"备份失败：\n{r.get('error','未知错误')}")
             return
@@ -1038,11 +1308,9 @@ class BackupApp:
         bad = len(results) - ok
         total = sum(x.real_size for x in results if x.ok)
         if bad == 0:
-            self.lbl_result.configure(text=f"✅ 全部通过 {ok}/{len(results)}",
-                                      style="Ok.TLabel")
+            self._set_result(f"✅ 全部通过 {ok}/{len(results)}", "Ok.TLabel")
         else:
-            self.lbl_result.configure(text=f"⚠️ {ok} 通过 / {bad} 失败",
-                                      style="Warn.TLabel")
+            self._set_result(f"⚠️ {ok} 通过 / {bad} 失败", "Warn.TLabel")
         self._status(f"完成：{ok}/{len(results)} 通过，共 {human_size(total)}")
 
         prev = r.get("prev")
