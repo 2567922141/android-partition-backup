@@ -298,15 +298,15 @@ No element is ever clipped — **at any window size, on any resolution, under an
 
 ### ADB server switch
 
-The UI has a row: **`ADB 服务: ● 运行中  [停止]  ☑ 退出时停止 ADB 服务`**.
+The UI has a row: **`ADB 服务: ● 运行中  [停止]  退出本程序时会自动停止 ADB 服务`**.
 
 | Control | What it does |
 |---|---|
 | Status text | Shows in real time whether the adb server is up (polled every 2.5 s via a millisecond-level port probe) |
 | `[启动]` / `[停止]` | Start or stop the adb server manually |
-| ☑ Exit-stop | **Checked by default** — runs `adb kill-server` when you close the window |
+| Auto-stop on exit | **Unconditional, no setting needed** — runs `adb kill-server` when you close the window |
 
-**Why this switch exists** — the adb server (listening on `5037`) is a **shared** long-lived process (Android Studio and scrcpy use the very same one). This tool never kills it while running; it only stops it when you explicitly press "stop" or leave the exit-stop box checked.
+**Why this switch exists** — the adb server (listening on `5037`) is a **shared** long-lived process (Android Studio and scrcpy use the very same one). So this tool never kills it while running (only when you explicitly press "stop"), but it **always stops it on exit**, leaving no leftover process behind.
 
 > ⚠️ **Pressing "stop" also pauses device detection** — otherwise the polling thread's next `adb devices` would immediately bring the server back up, and it would look like "stop does nothing". Press "start" to resume.
 
@@ -315,7 +315,7 @@ The UI has a row: **`ADB 服务: ● 运行中  [停止]  ☑ 退出时停止 AD
 ```
 1. poll_stop.set()        tell background threads to stop issuing adb calls
 2. kill_live_children()   kill any adb child processes still running
-3. adb kill-server        stop the server if the box is checked (must come after 2)
+3. adb kill-server        stop the server (unconditional, and must come after 2)
 4. wait for threads (<=0.6s), then destroy()
 ```
 

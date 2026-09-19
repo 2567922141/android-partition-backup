@@ -650,19 +650,16 @@ class BackupApp:
 
         # ---- ADB 服务 ----
         # 服务端是**多个工具共用**的常驻进程（Android Studio / scrcpy 也在用
-        # 同一个）。所以这里给出显式开关，而退出时是否停掉交给用户勾选。
+        # 同一个）。所以这里给出显式开关；退出时则**无条件**停掉它，不留残留。
         r5 = FlowFrame(f, gap=12, row_gap=6)
         r5.pack(fill="x", pady=(10, 0))
         self.srv_row = r5
         self.lbl_srv = ttk.Label(r5, text="ADB 服务: 检测中 ...")
         self.btn_srv = ttk.Button(r5, text="启动", width=8, command=self._toggle_server)
-        self.opt_killsrv = tk.BooleanVar(value=True)
         r5.add(self.lbl_srv)
         r5.add(self.btn_srv, gap=8)
-        r5.add(ttk.Checkbutton(r5, text="退出时停止 ADB 服务",
-                               variable=self.opt_killsrv), gap=16)
-        r5.add(ttk.Label(r5, text="（服务端是多个工具共用的常驻进程）",
-                         style="Sub.TLabel"), gap=6)
+        r5.add(ttk.Label(r5, text="退出本程序时会自动停止 ADB 服务",
+                         style="Sub.TLabel"), gap=16)
         self._srv_running = None
         self._srv_busy = False
 
@@ -1523,19 +1520,18 @@ class BackupApp:
         if leaked:
             self._log(f"[退出] 已回收 {leaked} 个仍在运行的 adb 子进程")
 
-        # ③ 按用户勾选停掉 adb 服务端。
-        #    必须排在 ② 之后 —— 它自己也是一次 adb 调用，放前面会被刚装好的
+        # ③ 停掉 adb 服务端 —— **无条件执行**，不给用户选择。
+        #    必须排在 ② 之后：它自己也是一次 adb 调用，放前面会被刚装好的
         #    清理逻辑误杀，服务端反而停不掉。
-        if self.opt_killsrv.get():
+        try:
+            ok, msg = adb_stop_server(self.adb_path)
+            self._log(f"[退出] 停止 ADB 服务：{'成功' if ok else '未成功'}（{msg}）")
+            self._drain_ui(0.05)
+        except Exception as e:
             try:
-                ok, msg = adb_stop_server(self.adb_path)
-                self._log(f"[退出] 停止 ADB 服务：{'成功' if ok else '未成功'}（{msg}）")
-                self._drain_ui(0.05)
-            except Exception as e:
-                try:
-                    self._log(f"[退出] 停止 ADB 服务失败：{e}")
-                except Exception:
-                    pass
+                self._log(f"[退出] 停止 ADB 服务失败：{e}")
+            except Exception:
+                pass
 
         # ④ 等后台线程退出。这两个都是 daemon 线程，本来就会随进程结束 ——
         #    等它们只是为了收尾干净，所以上限给得很短，别让用户点完 X 还等。
