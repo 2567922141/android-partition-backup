@@ -21,7 +21,7 @@ $Here    = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ToolDir = $Here
 $WsRoot  = Split-Path (Split-Path $Here -Parent) -Parent
 $PortDir = Join-Path $WsRoot "android-partition-backup-portable"      # 已构建好的便携版
-$Ver     = "2.1.0"
+$Ver     = "2.1.1"
 $RelRoot = Join-Path $WsRoot "发布包"                                  # 各版本一个子目录
 $RelDir  = Join-Path $RelRoot "v$Ver"                                  # 本次的输出目录
 

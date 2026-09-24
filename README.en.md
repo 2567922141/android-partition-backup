@@ -23,52 +23,13 @@
 
 ## ⚡ About This Project
 
-> **This is a 100% Vibe Coding project.**
+> **This is a 100% Vibe Coding project**, built by **DeepSeek**.
 
-Why the project was started: to back up the important partitions of an Android phone.
+***AI can make mistakes. It is intended for vibe coding and learning purposes only — do not use it in industrial production or any other critical field. Any losses are your own responsibility!!!***
 
-The project was completed by DeepSeek.
+**All code has been validated on a real device (Redmi K70). On other phones, please assess the risk yourself before using it for important data (correct operation on other phones is not guaranteed).**
 
-***AI can make mistakes. This is for vibe coding learning purposes only — please do not use it in industrial production or other critical industries. Any losses are your own responsibility!!!***
-
-> ⚠️ **Please be sure to read [`DISCLAIMER.md`](DISCLAIMER.md) before use** — writing to a partition is the only way to brick a device, and restore operations carry extremely high risk.
-
-| Stage | What the AI did | What the human did |
-|---|---|---|
-| **Research** | Searched GitHub for similar projects, confirmed that a "GUI multi-select backup tool" was a gap in the market | Set the direction of the requirements and scoped the features |
-| **Feasibility check** | Wrote a spike script to measure binary integrity of `adb exec-out` vs `adb shell` — found that the PTY corrupts 76739 bytes of 32 MB of data into `\r\n` | Provided a real device (Redmi K70) for testing |
-| **Performance tuning** | Compared 4 data-fetch methods × 2 write paths, chose the best combination at 14.8 MB/s | — |
-| **Coding** | Four modules, roughly 7000 lines; only the GUI uses PySide6, the core engine has zero dependencies | Reviewed round by round, made the calls on trade-offs |
-| **Code review** | Self-audit surfaced 4 real defects (including the classic trap of reading GUI variables from a worker thread) | — |
-| **Automated tests** | 4 test suites, 87 assertions in total, including a progress-bar test that specifically covers the TTY branch (**used for development-time regression only — not shipped with the repo**) | — |
-| **⭐ Manual testing** | Used human feedback to pinpoint root causes, fix them, and verify by regression | **A human ran the tests by hand**: walked the full GUI backup flow on a real device, and verified portable-version portability on a different computer (a VM) |
-| **On-device validation** | Compared byte-for-byte against a manual backup with sha256, 18/18 identical | Ran end-to-end on a real device and signed off on the results |
-
-**But keep it in perspective**: AI makes mistakes too. Real-device testing in the **early** days already caught defects the AI had written:
-
-  1. A/B slot suffixes were not stripped, leaving 40+ partitions "unclassified"
-  2. Whole-disk symlinks in by-name were treated as partitions
-  3. The rule tables did not cover everything
-  4. There was a risk of backup failure
-
-Then, at the **human on-device acceptance** stage, 3 more defects surfaced that were subtler still and completely outside the reach of automated tests — see the next section 👇
-
-### 🧑🔬 Testing is done by AI and humans **together**
-
-The automated tests were written by the AI (4 suites / 87 assertions, **development-time only — not shipped with the repo**), but **manual testing was not a formality — it was the main bug-catcher**.
-
-The 3 defects below were **not covered by a single one** of the AI's 87 assertions; every one of them was exposed by **a human testing by hand**:
-
-| # | What the human did | The defect it exposed |
-|---|---|---|
-| 1 | Ran the **complete GUI backup flow** on a real device | The GPT tail backup of all 6 disks **failed**, yet the UI showed only "passed 20/26 items". The root cause was treating a Windows local path as a device path — a code path the AI's regression tests had never actually exercised |
-| 2 | Ran the full portable version **on a different computer** (a VM) | The `/data/adb` environment bundle failed (39/40). The true behaviour of the portable package in an **unfamiliar environment** can only be verified by switching machines |
-| 3 | Examined the UI feedback on failure | When the environment bundle failed, **the reason was invisible** — just a red X → this led to the addition of streaming output and integrity verification |
-
-> 📌 **Conclusion**: automated tests prevent regressions, but they **cannot find the "the AI assumed it works that way" class of mistake**.
-> What makes this tool safe to hand to others is that **a human actually went and used it**.
-
-**All code has been validated on a real device (Redmi K70). On other phones, please assess the risk yourself before using it to back up important data (correct operation on other phones is not guaranteed).**
+> ⚠️ **Please read [`DISCLAIMER.md`](DISCLAIMER.md) before use** — writing to a partition is the only way to brick a device, and restore operations carry extremely high risk.
 
 ---
 
@@ -586,7 +547,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Item | Value |
 |---|---|
-| Tool version | **2.1.0** |
+| Tool version | **2.1.1** |
 | Core version | 1.0.0 |
 | Profile library version | 1.0.0 |
 | Dependencies | **PySide6** (the GUI) + the Python standard library. The core engine, `backup_core.py`, still has **zero third-party dependencies** and runs standalone from the CLI |
@@ -596,6 +557,7 @@ then add `(fnmatch pattern, description)` entries to rule tables such as `TIER1_
 
 | Version | Changes |
 |---|---|
+| **2.1.1** | **Added a pre-backup preflight** — before anything starts, five checks run (device connection / root access / device writability / **transfer stress test** / local free space); the transfer test actually moves 16 MB and compares hashes on both ends, and the whole thing takes about two seconds. If any check fails, a dialog explains why and **you decide whether to continue anyway**. **Added transfer-loss circuit breaking with automatic reconnect** — a jittery cable, a poor USB port or a killed adb server all break the transfer, and the tool used to keep going with a dead handle, grinding through every remaining partition and filling the screen with `device not found` for nothing. Now, when the transfer dies: one cheap liveness probe → retry the current partition in place if the link answers → otherwise `kill-server`/`start-server` and reconnect → continue once it is back. If it still fails, the run **aborts immediately with a dialog** telling you which partition it died on, how many finished, and to check the cable or try another USB port — every completed file is kept. This also fixes a trap only real hardware reveals: when a transfer is cut mid-flight, **adb returns exit code 0 with empty stderr**, and the only signal is a badly short byte count (measured: 9.0 GB expected, 947.5 KB received) — the old check mistook that for an ordinary failure and silently disabled the circuit breaker. **Fixed a success message that buried the failure** — the green "N items matched the device-side hash" line used to print no matter how many partitions failed, so with 26 of 27 failing it became the most prominent conclusion on screen; it now only appears when everything succeeded, and a failure instead shows a prominent failure count plus "this run is incomplete". Also: the partition list is no longer cleared from the UI while a backup is running (it used to empty out the moment the device dropped, leaving the UI out of sync with the running job). **Fixed the partition table being unreadable in dark mode** — row backgrounds were hard-coded to light colours (tier-1 `#fff4e5`, tier-2 `#eef6ff`) with no matching text colour, so in dark mode the text fell back to the system's near-white and measured a contrast ratio of just **1.09:1** (the WCAG threshold is 4.5:1), leaving whole rows invisible. Colours are now chosen as background/foreground **pairs** per system theme (dark tier-1 is `#ffc98a` on `#3a2a14` = 9.19:1), and the delegate now also owns the **selected** state — previously the background stayed while the text switched to the highlight colour, which was equally unreadable. This also fixes the **2.85:1** grey used for `cdt`-style notes in light mode. **Exit is much faster** — closing the window used to burn a fixed ~465 ms of pure waiting (a 0.35 s drain grace, 0.05 s, then a thread-wait loop) whether or not anything was running; it is now staged, so an **idle exit takes the fast path** (measured **57–63 ms**) and only a running backup shows "正在退出，请稍候…" and waits for cleanup. `adb kill-server` moved to a short-lived thread so an unresponsive server no longer freezes the UI |
 | **2.1.0** | **New "package the backup into a ZIP when finished"** (optional, off by default) — ticking it produces one extra zip while **the original folder is left exactly as it is**. Uses the stdlib `zipfile` + `ZIP_DEFLATED`: **zero third-party dependencies, zero external processes**; measured on a real 971.5 MB backup → **138.7 MB (85.7% saved) in 5.2 seconds**. `ZIP_LZMA` is deliberately **not** used (smaller, but Windows Explorer cannot open it). A packaging failure **is not a backup failure**. Also fixes one real defect: `manifest.txt` / `README.md` / `backup_log.txt` are written **after** the backup finishes, so unless they were added to the zip the unpacked backup would be **missing its checksum manifest and restore notes** — now appended via zip's append mode. **Also adds a "task lock while a backup is running"** (2026-09-19): operations that would interfere with this run (refresh device / check root / start-stop the ADB server / change the output location / change the profile / change a table tick) **stay clickable, and clicking one pops up a dialog explaining why**, with the profile and table ticks additionally **rolled back visually**; the buttons are **deliberately not grayed out** — a grayed-out button does nothing when clicked and explains nothing either, so the user just assumes the program has frozen; "✕ cancel" stays available the whole time. |
 | **2.0.0** | **The GUI was migrated from Tkinter to PySide6 (Qt6)** — which finally kills the window-drag stutter at the root. Tk gives every widget its own HWND, so with 114 widgets nested 8 levels deep each resize cost 69 ms and eight Tk-side optimisations all failed; Qt measures 13.7 ms per resize, **4–5× faster**, and dragging finally keeps up with the cursor. Feature-for-feature identical to 1.1.1, with `backup_gui.py` (the Tk version) kept as a fallback. The package grew from 50 MB to 152 MB because it now bundles Qt |
 | 1.1.1 | **Device-side hashing is now on by default** — backups automatically compare against the phone's current partition via `sha256sum` (the only layer that proves the device bytes equal the disk bytes); partitions of 1 GiB or more are skipped automatically, and anything left unverified is reported honestly in the log and the dialog. **Fixed "diff against previous backup" being silently dead for partitions** (manifest lines with an empty `sub` were skipped wholesale by a `len(parts) >= 5` test, so only 18 of 45 entries were recognised). **`*_layout.txt` and `byname_mapping.txt` are now in the manifest** (they had no hash protection before). **New detailed device-info bar at the top** (system / chip / version / platform / kernel / ABI / RAM / screen / slot / patch / root, wrapping automatically in narrow windows); **ADB server switch moved to the top**; **ADB server now stops unconditionally on exit**; **fixed `adb.exe` being orphaned after closing the window**; **fixed window-drag stutter** (146 ms → 54 ms per frame, the limit of what Tk-side optimisation could reach); **fixed UI elements being hidden after resizing** — now a responsive layout |

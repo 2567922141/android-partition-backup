@@ -31,10 +31,12 @@ import atexit
 import hashlib
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -240,6 +242,67 @@ ENORMOUS_THRESHOLD = 20 * 1024 * 1024 * 1024   # 20 GiB
 # 没有这道保护的话，adb 一旦挂住，备份线程会无限等待。
 STALL_TIMEOUT = 120.0
 
+# ---- 传输失联判定 ----------------------------------------------------------
+# 实测（真机 Redmi K70 掉线日志）：设备从 USB 上掉下去之后，adb.exe 会以
+# **-1** 退出，而 Windows 上 Python 读回来是无符号化的 4294967295。
+# 这个返回码的含义不是「命令跑失败」，而是「压根没连上 adbd」——
+# 命令一个字节都没上设备。此时回退到路径 B（设备端暂存 + pull）是纯浪费：
+# 那条路每个分区要再打 4~5 次 adb，全部会以同样的方式失败。
+ADB_RC_FAILED = -1                    # adb.exe 的连接失败返回码
+ADB_RC_FAILED_U32 = 0xFFFFFFFF        # 同上，Windows 无符号化之后的样子
+
+# stderr 里命中这些**正则** = 设备不在 adb 的连接表里（或状态不对）。
+#
+# ⚠️ 必须是正则，不能是子串。真机原文是：
+#     adb.exe: device '6f06de3d' not found
+#   序列号夹在 "device" 和 "not found" 中间，`"device not found" in text`
+#   匹配不上 —— 这个假阴性实际发生过（假 adb 桩测试一次抓出来）。
+TRANSPORT_DEAD_PATTERNS = (
+    r"device\s+'[^']*'\s+not\s+found",     # 带序列号：device 'X' not found
+    r"device\s+not\s+found",               # 不带序列号
+    r"\bdevice\s+offline\b",
+    r"\bno\s+devices?\b",
+    r"\bdevice\s+unauthorized\b",
+    r"\berror:\s*closed\b",
+    r"\bconnection\s+reset\b",
+)
+_TRANSPORT_DEAD_RE = re.compile("|".join(TRANSPORT_DEAD_PATTERNS), re.IGNORECASE)
+
+# 传输被掐断时，实收字节往往**远小于**应有大小。实测（真机 kill-server）：
+# 应为 9.0 GB，实收 947.5 KB，而 adb 的返回码是 **0**、stderr 是**空的** ——
+# 光看返回码和错误文本永远判不出来，唯一信号就是字节数严重不足。
+#
+# 为什么用 50% 而不是「差一点都不行」：
+#   · 真机上设备读取速度上限约 15 MB/s，而 adb 只可能更慢。所以「收到不足
+#     一半」只有两种解释：传输被掐断，或者读到了坏块。两种都该走掉线判定
+#     （坏块时探活会通过，于是原地重试，代价只是一次多余的读）。
+#   · 反过来，把阈值放宽会让「确实读不全的分区」被误判成掉线，
+#     那时探活通不过、会触发一次不必要的 kill-server。
+# 50% 对这两种误判都是安全的一侧。
+TRANSPORT_SHORTFALL_RATIO = 0.5
+
+# 探活 / 重连的时间预算（秒）。都在「传输已经死了」的前提下使用，
+# 所以花费这点时间是稳赚的：不试就必然白跑剩下的全部分区。
+PROBE_TIMEOUT = 10.0                  # 单次 adb get-state
+REVIVE_WAIT_TIMEOUT = 25.0            # kill-server 之后等设备自己回来
+REVIVE_POLL_INTERVAL = 1.0
+BLIP_RETRY_DELAY = 2.0                # 瞬时抖动后重试前先让 USB 口喘口气
+
+# ---- 备份前预检 ------------------------------------------------------------
+# 【为什么要有预检】
+# 真机实测暴露的故障形态是：设备连着、`adb devices` 显示 device、root 也正常，
+# 但**一传大数据就掉线**。静态检查永远抓不到这种，必须真正压一次传输。
+# 所以第 4 项不是「再查一遍设备在不在」，而是实打实写一块数据下去、读回来、
+# 两端比对哈希 —— 它一次性验证了「这条 USB 通道能不能扛住持续传输」。
+#
+# 预检在**开始备份之前**跑完，不改动备份流程本身；不通过时由界面决定
+# 「警告后继续」还是「放弃」（用户保留最终决定权，不做硬拦截）。
+PREFLIGHT_TEST_BYTES = 16 * 1024 * 1024       # 16 MB：足够让不稳的线露馅
+PREFLIGHT_DEVICE_FILE = "/data/local/tmp/.apb_preflight.bin"
+PREFLIGHT_STALL_TIMEOUT = 15.0                # 传输多久没有新字节就判卡死
+PREFLIGHT_CMD_TIMEOUT = 60.0                  # 单次 adb 命令的上限
+PREFLIGHT_DISK_FACTOR = 1.05                  # 本地空间留 5% 余量
+
 
 # ==============================================================================
 #  异常
@@ -263,6 +326,22 @@ class Cancelled(BackupError):
 
 class FallbackNeeded(BackupError):
     """路径 A 失败，需要切换到路径 B。"""
+
+
+class DeviceLost(BackupError):
+    """设备在传输中途掉线，且一次重连尝试也没能救回来。
+
+    与 FallbackNeeded 的区别是**后果**：FallbackNeeded 意味着「换条路再试」，
+    DeviceLost 意味着「这条路和那条路都断了，继续跑下去只会刷屏」。
+    所以它必须让整个 run() 停下来，而不是被每个分区各吞一次。
+
+    probe_ok=True 表示抛出前那次探活**通过**了 —— 设备其实还在，刚才只是
+    瞬时抖动。调用方应当原地重试一次，而不是急着熔断。
+    """
+
+    def __init__(self, message: str, probe_ok: bool = False):
+        super().__init__(message)
+        self.probe_ok = probe_ok
 
 
 # ==============================================================================
@@ -886,6 +965,83 @@ class Adb:
             cmd += ["-s", self.serial]
         return cmd
 
+    # ------------------------------------------------------ 传输失联与自愈
+    def is_transport_error(self, rc: int, err_text: str = "") -> bool:
+        """这次失败是「设备没了」还是「命令跑错了」？
+
+        只认两种铁证，避免把普通的分区读取失败误判成掉线：
+          1. adb.exe 以 -1 / 0xFFFFFFFF 退出 —— 它连 adbd 都没连上；
+          2. stderr 明确说设备不在连接表里（not found / offline / ...）。
+             注意这里用正则：真机原文是 device '6f06de3d' not found，
+             序列号夹在中间，子串匹配会漏。
+        """
+        if rc in (ADB_RC_FAILED, ADB_RC_FAILED_U32):
+            return True
+        return bool(_TRANSPORT_DEAD_RE.search(err_text or ""))
+
+    def probe_alive(self, timeout: float = PROBE_TIMEOUT) -> bool:
+        """一次便宜的探活：设备现在是否真的可用（几十毫秒）。
+
+        故意不用 shell —— get-state 不经过 adbd 的 shell 通道，设备刚回来、
+        adbd 还没完全就绪时它也能先给出答案。
+        """
+        try:
+            out, _, rc = self.run(["get-state"], timeout=timeout)
+        except AdbError:
+            return False
+        if rc != 0:
+            return False
+        return out.decode("utf-8", "replace").strip() == "device"
+
+    def revive_link(self, log_cb: Optional[Callable[[str], None]] = None,
+                    timeout: float = REVIVE_WAIT_TIMEOUT) -> bool:
+        """传输已经死了之后的一次重连尝试。成功返回 True。
+
+        【为什么这里敢 kill-server】
+        备份期间启停 ADB 服务是被拦住的（GUI 那边有 _guard_busy），理由是
+        start-server 会掐掉现存连接、重建服务端 —— 对一条**正在正常传输**的
+        连接当然是致命的。但走到这里的前提恰恰是传输**已经断了**，前面那条
+        连接已经没有任何东西可损失，重建服务端就是唯一还能做的事。
+
+        顺序：kill-server（清掉那个还记着旧序列号的僵尸服务端）
+              → start-server → 轮询 get-state 等设备自己回来。
+        """
+        def say(s: str):
+            if log_cb:
+                log_cb(s)
+
+        say("  [i] 传输已中断，正在尝试重连设备（一次）...")
+        for args in (["kill-server"], ["start-server"]):
+            try:
+                _run([self.adb_path] + args, stdout=subprocess.PIPE,
+                     stderr=subprocess.PIPE, creationflags=_CREATE_NO_WINDOW,
+                     timeout=30)
+            except Exception:                       # noqa: BLE001 - 尽力而为
+                pass
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.probe_alive(timeout=5.0):
+                say("  [OK] 设备已重新连接，继续备份")
+                return True
+            time.sleep(REVIVE_POLL_INTERVAL)
+        say("  [!] 重连失败：设备没有回来")
+        return False
+
+    def _on_transport_failure(self, what: str, rc: int, err_text: str
+                              ) -> tuple[bool, bool, str]:
+        """把一次传输失败分类。返回 (是否掉线, 探活是否通过, 给人看的说明)。
+
+        掉线时先探活：探活通过说明只是一次瞬时抖动（线松了一下、USB 忙），
+        调用方可以直接重试；探活不通过才需要判断「走重连还是彻底放弃」——
+        那个决定留给 runner，因为它才知道整轮已经跑了多少。
+        """
+        if not self.is_transport_error(rc, err_text):
+            return False, False, ""
+        detail = f"{what}: {err_text.strip()[:160]}" if err_text.strip() else what
+        alive = self.probe_alive()
+        return True, alive, detail
+
     # ---------------------------------------------------------------- 执行
     def run(self, args: list[str], timeout: float = 60) -> tuple[bytes, bytes, int]:
         try:
@@ -1231,6 +1387,7 @@ class Adb:
         dd_path: str = "dd",
         progress_cb: Optional[Callable[[int, float], None]] = None,
         cancel: Optional[threading.Event] = None,
+        blip_retry_delay: float = 0.0,
     ) -> tuple[int, float]:
         """
         路径 A：exec-out 把 dd 的输出直接重定向到本地文件。
@@ -1240,6 +1397,10 @@ class Adb:
 
         为什么要比对字节数而不是只看返回码：
             su 失败时 stdout 为空但 rc 仍可能是 0，必须用字节数兜底。
+
+        blip_retry_delay > 0 表示这是「探活通过后的重试」，重试前先等一下，
+        给 USB 端口一点恢复时间。重试的决策在 runner 那边做（它才知道整轮
+        已经跑了多少、还值不值得再试）。
         """
         validate_partition_name(part_name)
         remote = f"{dd_path} if=/dev/block/by-name/{part_name} bs={DD_BLOCK_SIZE} 2>/dev/null"
@@ -1247,6 +1408,9 @@ class Adb:
         t0 = time.time()
 
         with open(dest_path, "wb") as fout, open(err_path, "wb") as ferr:
+            delayed = max(0, int(blip_retry_delay))
+            if delayed:
+                time.sleep(delayed)
             proc = subprocess.Popen(
                 self._base() + ["exec-out", f"su -c '{remote}'"],
                 stdout=fout, stderr=ferr, creationflags=_CREATE_NO_WINDOW)
@@ -1296,15 +1460,62 @@ class Adb:
             except OSError:
                 pass
 
+        # 设备掉线必须在**回退之前**拦下来。否则每个分区都会走一遍
+        # 「流式失败 → 回退到暂存模式 → 暂存模式再失败」，而回退那条路
+        # 每个分区还要再打 4~5 次注定失败的 adb —— 27 个分区能刷出上百行
+        # 无用调用，真机实测就是这么刷屏 9 秒然后 0 个成功的。
+        lost, probe_ok, why = self._on_transport_failure(
+            f"exec-out 返回码 {proc.returncode}", proc.returncode, err_text)
+        if lost:
+            raise DeviceLost(
+                why + ("（探活通过：设备仍在，属瞬时中断）" if probe_ok
+                       else "（探活失败：设备已不在 adb 连接表中）"),
+                probe_ok=probe_ok)
         if proc.returncode != 0:
             raise FallbackNeeded(f"exec-out 返回码 {proc.returncode}: {err_text[:200]}")
         if expected_size and size != expected_size:
+            # ⚠️ 实测（真机 kill-server 掐断传输）：adb 返回码是 **0**、stderr
+            #    是**空的**，只有字节数严重不足这一个信号 —— 应为 9.0 GB，
+            #    实收 947.5 KB。若这里直接抛 FallbackNeeded，熔断就永远不会
+            #    触发，26 个分区逐个刷屏的原始故障会一模一样地复现。
+            #    所以「严重不足」必须按传输被掐断处理，而不是普通失败。
+            shortfall = self.is_truncated_transfer(size, expected_size)
+            if shortfall:
+                raise DeviceLost(
+                    f"传输被截断：{shortfall}，耗时 {elapsed:.1f}s"
+                    + (f"：{err_text[:120]}" if err_text
+                       else "（adb 返回码 0、无错误输出）"),
+                    probe_ok=self.probe_alive())
             raise FallbackNeeded(
                 f"字节数不符：应为 {expected_size}，实收 {size}（差 {size - expected_size}）"
                 + (f" {err_text[:120]}" if err_text else ""))
         if size == 0:
             raise FallbackNeeded(f"收到 0 字节 {err_text[:200]}")
         return size, elapsed
+
+    def is_truncated_transfer(self, size: int, expected_size: int) -> str:
+        """收到的字节是否少到只可能是「传输被掐断」。是则返回原因，否则空串。
+
+        ⚠️ 这个方法存在的唯一理由，是真机上量到的一个陷阱：
+        用 `adb kill-server` 掐断传输时，adb 的返回码是 **0**、stderr 是
+        **空的** —— `is_transport_error()` 对这种情况返回 False。
+        唯一能看出问题的信号是字节数：应为 9.0 GB，实收 947.5 KB。
+
+        第一版判定只看返回码和 stderr，于是把它当成普通的「字节数不符」，
+        走进「回退到设备端暂存模式」；而熔断依赖 DeviceLost，于是永远不触发
+        —— 26 个分区逐个刷屏的原始故障会一模一样地复现。
+
+        为什么阈值取一半而不是「差一点都不行」：设备读取上限约 15 MB/s，
+        adb 只会更慢，所以「不足一半」不可能是正常读取被中断的结果。
+        真出现这种比例，只可能是链路被掐断（或读到坏块，而坏块时探活会
+        通过 → 走原地重试，代价只是一次多余的读）。这个阈值在两侧都安全。
+        """
+        if expected_size <= 0 or size >= expected_size:
+            return ""
+        if size >= expected_size * TRANSPORT_SHORTFALL_RATIO:
+            return ""
+        return (f"应为 {human_size(expected_size)}，实收 {human_size(size)}"
+                f"（{size * 100.0 / expected_size:.2f}%）")
 
     def stage_partition_and_pull(
         self,
@@ -1536,6 +1747,387 @@ class ArchiveSummary:
 # ==== APB_ARCHIVE END ====
 
 
+@dataclass
+class AbortInfo:
+    """设备中途失联导致整轮备份提前收尾的说明。
+
+    真机实测（Redmi K70，27 个分区）：设备在第二个分区掉线后，旧版本会把
+    剩下的 26 个分区全部走一遍「流式失败 → 回退暂存 → 回退再失败」，
+    9 秒刷出上百行注定失败的 adb 调用，最后还打一行绿色的「1 项与设备端
+    哈希核对一致」——用户完全看不出发生了什么。这个结构就是让那种情况
+    变成一句能弹到用户脸上、且不会撒谎的说明。
+    """
+    partition: str = ""                # 掉在哪个分区上
+    reason: str = ""                   # 原文原因（含探活结论）
+    done_ok: int = 0                   # 已成功完成的分区数
+    done_total: int = 0                # 本轮计划备份的分区数
+    revive_tried: bool = False         # 是否已经试过重连
+    revive_ok: bool = False            # 重连是否成功过（用于区分「试了没用」）
+    outdir: str = ""                   # 已完成文件所在目录
+
+    @property
+    def short(self) -> str:
+        return (f"设备在备份 {self.partition} 时掉线，"
+                f"已完成 {self.done_ok}/{self.done_total}")
+
+    @property
+    def advice(self) -> str:
+        if self.revive_tried and not self.revive_ok:
+            return ("已尝试自动重连但设备没有回来。请检查数据线/USB 口"
+                    "（换一个口或用原装线），确认手机没有重启，然后重试。")
+        return "请检查数据线/USB 口，确认手机仍在 adb 连接状态，然后重试。"
+
+
+# ==============================================================================
+#  备份前预检
+# ==============================================================================
+
+@dataclass
+class PreflightItem:
+    """预检里的一项。state: "ok" | "warn" | "fail"。"""
+    key: str = ""
+    title: str = ""
+    state: str = "ok"
+    detail: str = ""
+    advice: str = ""                   # state != "ok" 时给人看的处置建议
+
+
+@dataclass
+class PreflightReport:
+    """预检总结果。
+
+    verdict 三态：
+      "ok"   —— 全部通过，界面静默放行（只写日志，不打扰）
+      "warn" —— 能跑，但有风险（例如本地空间紧张）；弹窗告知，用户可继续
+      "fail" —— 有硬伤（例如传输压力测试就掉线）；弹窗警告，用户仍可强行继续
+    """
+    verdict: str = "ok"
+    items: list = field(default_factory=list)
+    seconds: float = 0.0
+
+    def add(self, key: str, title: str, state: str, detail: str = "",
+            advice: str = ""):
+        self.items.append(PreflightItem(key=key, title=title, state=state,
+                                        detail=detail, advice=advice))
+        return self
+
+    def _worst(self) -> str:
+        states = {i.state for i in self.items}
+        if "fail" in states:
+            return "fail"
+        if "warn" in states:
+            return "warn"
+        return "ok"
+
+    @property
+    def passed(self) -> bool:
+        return self.verdict == "ok"
+
+    @property
+    def bad_items(self) -> list:
+        return [i for i in self.items if i.state != "ok"]
+
+    @property
+    def summary(self) -> str:
+        if self.verdict == "ok":
+            return f"预检全部通过（{len(self.items)} 项）"
+        fails = sum(1 for i in self.items if i.state == "fail")
+        warns = sum(1 for i in self.items if i.state == "warn")
+        bits = []
+        if fails:
+            bits.append(f"{fails} 项未通过")
+        if warns:
+            bits.append(f"{warns} 项有风险")
+        return "预检：" + "，".join(bits)
+
+    @property
+    def lines(self) -> str:
+        """给人看的多行说明（弹窗正文用）。"""
+        out = [self.summary, ""]
+        for i in self.items:
+            mark = {"ok": "✅", "warn": "⚠️", "fail": "❌"}.get(i.state, "•")
+            out.append(f"{mark} {i.title}")
+            if i.detail:
+                out.append(f"     {i.detail}")
+            if i.state != "ok" and i.advice:
+                out.append(f"     → {i.advice}")
+        return "\n".join(out)
+
+
+def run_preflight(adb: "Adb", outdir: str, planned_bytes: int = 0,
+                  log_cb: Callable[[str], None] = lambda s: None,
+                  cancel: Optional[threading.Event] = None,
+                  test_bytes: Optional[int] = None) -> PreflightReport:
+    """备份前的完整预检。绝不抛异常 —— 任何意外都收敛成一项 fail。
+
+    【为什么每一项都要自己兜异常】
+    预检的职责是「在开始前告诉用户能不能跑」，它自己崩掉就等于没有预检，
+    而且会把一次「本来能备份」的机会变成一次报错。所以每项都独立 try。
+
+    【第 4 项为什么是压力测试而不是再查一次 adb devices】
+    用户的真实故障是：设备连着、授权正常、root 正常，但传输一开始就掉，
+    从第二个分区起全部失败。`adb devices` 对这种情况完全无感。
+    只有真正搬一次数据、再把两端哈希对一遍，才能证明这条通道扛得住。
+    """
+    # ⚠️ 这几个值必须在**调用时**从模块常量取，不能写成默认参数。
+    #    写成 `test_bytes: int = PREFLIGHT_TEST_BYTES` 的话，默认值在函数
+    #    定义那一刻就被绑死了，之后改常量完全无效 —— 真机上实际发生过：
+    #    驱动脚本把 PREFLIGHT_TEST_BYTES 调成 1 MB 想跑快速模式，
+    #    结果照样写了 16 MB。
+    if test_bytes is None:
+        test_bytes = PREFLIGHT_TEST_BYTES
+    stall_timeout = PREFLIGHT_STALL_TIMEOUT
+    cmd_timeout = PREFLIGHT_CMD_TIMEOUT
+
+    t0 = time.time()
+    rep = PreflightReport()
+    log = log_cb
+
+    def cancelled() -> bool:
+        return cancel is not None and cancel.is_set()
+
+    # ---- 1. 设备在不在、状态对不对 -------------------------------------
+    try:
+        out, err, rc = adb.run(["get-state"], timeout=PROBE_TIMEOUT)
+        state = out.decode("utf-8", "replace").strip()
+        if rc != 0 or state != "device":
+            raw = (err or out).decode("utf-8", "replace").strip()[:120]
+            rep.add("state", "设备连接", "fail",
+                    f"adb get-state 返回 {state or 'rc=%d' % rc} {raw}".strip(),
+                    "重新插拔 USB 线，确认手机已解锁并点了「允许 USB 调试」。")
+        else:
+            rep.add("state", "设备连接", "ok", "adb get-state = device")
+    except Exception as e:                       # noqa: BLE001
+        rep.add("state", "设备连接", "fail", f"{type(e).__name__}: {e}",
+                "adb 无法通信，请重新插拔设备后重试。")
+        rep.verdict = rep._worst()
+        rep.seconds = time.time() - t0
+        return rep
+
+    log(f"  [预检] 设备连接      ok")
+
+    # 设备不在连接表里，后面每一项（su / 写文件 / 传输）都必然失败，
+    # 而且传输那项还会白白等一轮停滞超时。直接收手，把话说清楚。
+    if any(i.key == "state" and i.state == "fail" for i in rep.items):
+        rep.verdict = rep._worst()
+        rep.seconds = time.time() - t0
+        return rep
+
+    # ---- 2. root 是否真的可用 -------------------------------------------
+    try:
+        uid = adb.su("id", timeout=cmd_timeout).strip()
+        if "uid=0" in uid:
+            rep.add("root", "Root 权限", "ok", uid[:80])
+            log(f"  [预检] Root 权限      ok")
+        else:
+            rep.add("root", "Root 权限", "fail",
+                    f"su 有返回但不是 root：{uid[:80] or '(空)'}",
+                    "打开 Magisk，确认本机授权里有 adb/shell 且已允许，"
+                    "必要时在手机上重新授权。")
+            log(f"  [预检] Root 权限      FAIL")
+    except Exception as e:                       # noqa: BLE001
+        rep.add("root", "Root 权限", "fail", f"{type(e).__name__}: {e}",
+                "su 不可用。没有 root 就无法读取分区，请先修好 root 再备份。")
+        log(f"  [预检] Root 权限      FAIL")
+
+    # root 不通就没必要往下测传输了（后面每项都依赖 su）
+    if any(i.key == "root" and i.state == "fail" for i in rep.items):
+        rep.verdict = rep._worst()
+        rep.seconds = time.time() - t0
+        return rep
+
+    # ---- 3. 设备可写（临时目录能建能删）---------------------------------
+    try:
+        adb.su(f"rm -f {PREFLIGHT_DEVICE_FILE}", timeout=cmd_timeout)
+        adb.su(f"touch {PREFLIGHT_DEVICE_FILE}", timeout=cmd_timeout)
+        ok = adb.su_ok(f"test -f {PREFLIGHT_DEVICE_FILE}",
+                       timeout=cmd_timeout)
+        adb.su(f"rm -f {PREFLIGHT_DEVICE_FILE}", timeout=cmd_timeout)
+        if ok:
+            rep.add("write", "设备可写", "ok", "/data/local/tmp 可读可写")
+            log(f"  [预检] 设备可写      ok")
+        else:
+            rep.add("write", "设备可写", "fail", "写入后读不到该文件",
+                    "设备存储可能已满或分区只读。清理空间后重试。")
+            log(f"  [预检] 设备可写      FAIL")
+    except Exception as e:                       # noqa: BLE001
+        rep.add("write", "设备可写", "warn", f"{type(e).__name__}: {e}",
+                "无法确认设备可写，备份可能中途失败。")
+
+    if cancelled():
+        rep.verdict = rep._worst()
+        rep.seconds = time.time() - t0
+        return rep
+
+    # ---- 4. 持续传输压力测试（这项才是真正抓掉线的）---------------------
+    try:
+        item = _preflight_transfer(adb, log, test_bytes, cancelled,
+                                   stall_timeout=stall_timeout,
+                                   cmd_timeout=cmd_timeout)
+        rep.items.append(item)
+    except Exception as e:                       # noqa: BLE001
+        rep.add("transfer", "传输压力测试", "fail",
+                f"{type(e).__name__}: {e}",
+                "传输测试异常中止。请检查数据线与 USB 口后重试。")
+
+    # ---- 5. 本地目标盘空间 ----------------------------------------------
+    try:
+        usage = shutil.disk_usage(_existing_parent(outdir))
+        need = int(planned_bytes * PREFLIGHT_DISK_FACTOR)
+        free = usage.free
+        if planned_bytes and free < need:
+            rep.add("space", "本地空间", "fail",
+                    f"需要约 {human_size(need)}，可用仅 {human_size(free)}",
+                    "换一个剩余空间更大的输出目录，或减少勾选的分区。")
+            log(f"  [预检] 本地空间      FAIL")
+        elif planned_bytes and free < need * 1.5:
+            rep.add("space", "本地空间", "warn",
+                    f"可用 {human_size(free)}，仅比需要的 "
+                    f"{human_size(need)} 多出不到一半",
+                    "空间偏紧，建议清理或换目录。")
+            log(f"  [预检] 本地空间      warn")
+        else:
+            rep.add("space", "本地空间", "ok",
+                    f"可用 {human_size(free)}"
+                    + (f"，需要约 {human_size(need)}" if planned_bytes else ""))
+            log(f"  [预检] 本地空间      ok")
+    except Exception as e:                       # noqa: BLE001
+        rep.add("space", "本地空间", "warn", f"无法获知：{e}",
+                "无法确认目标盘空间，备份可能在中途写满。")
+
+    rep.verdict = rep._worst()
+    rep.seconds = time.time() - t0
+    log(f"  [预检] {rep.summary}  耗时 {rep.seconds:.1f}s")
+    return rep
+
+
+def _existing_parent(path: str) -> str:
+    """找到一个真实存在的祖先目录 —— 输出目录可能还没被创建。"""
+    p = os.path.abspath(path or ".")
+    while p and not os.path.isdir(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    return p or "."
+
+
+def _preflight_transfer(adb: "Adb", log: Callable[[str], None],
+                        test_bytes: int, cancelled: Callable[[], bool],
+                        stall_timeout: float = PREFLIGHT_STALL_TIMEOUT,
+                        cmd_timeout: float = PREFLIGHT_CMD_TIMEOUT
+                        ) -> PreflightItem:
+    """写一块数据到设备 → 读回本地 → 两端 sha256 比对 → 清理。
+
+    这一项是预检的核心：它是唯一能证明「这条 USB 通道扛得住持续传输」
+    的检查。真机上设备「连着但一传就掉」的故障，只有这里能提前抓到。
+
+    设备端文件用完**必删**（成功、失败、取消三条路都删），
+    绝不为了自检在用户手机上留垃圾。
+    """
+    title = "传输压力测试"
+    size = int(test_bytes)
+    local = None
+    t0 = time.time()
+    try:
+        # 设备端：用 dd 从 /dev/zero 写一个确定大小、确定内容的文件
+        adb.su(f"rm -f {PREFLIGHT_DEVICE_FILE}", timeout=cmd_timeout)
+        adb.su(f"dd if=/dev/zero of={PREFLIGHT_DEVICE_FILE} "
+               f"bs=1048576 count={max(1, size // 1048576)}",
+               timeout=cmd_timeout)
+
+        # 设备端哈希
+        dev_sha = adb.su(f"sha256sum {PREFLIGHT_DEVICE_FILE}",
+                         timeout=cmd_timeout).split()
+        dev_sha = dev_sha[0].strip().lower() if dev_sha else ""
+        if not dev_sha:
+            return PreflightItem(
+                key="transfer", title=title, state="fail",
+                detail="设备端算不出 sha256（sha256sum 不可用或文件没写成）",
+                advice="设备端缺少 sha256sum，或 dd 写入失败。"
+                       "请确认 root 正常后重试。")
+
+        # 读回来（adb pull），带停滞检测 —— 卡死要能及时收手
+        fd, local = tempfile.mkstemp(prefix="apb_preflight_", suffix=".bin")
+        os.close(fd)
+        proc = subprocess.Popen(
+            adb._base() + ["pull", PREFLIGHT_DEVICE_FILE, local],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            creationflags=_CREATE_NO_WINDOW)
+        _register_child(proc)
+        last_size, stall_since = -1, time.time()
+        while proc.poll() is None:
+            if cancelled():
+                proc.kill()
+                proc.wait(timeout=10)
+                return PreflightItem(key="transfer", title=title, state="warn",
+                                     detail="用户取消，未完成传输测试",
+                                     advice="传输稳定性未经验证。")
+            try:
+                cur = os.path.getsize(local)
+            except OSError:
+                cur = 0
+            if cur != last_size:
+                last_size, stall_since = cur, time.time()
+            elif time.time() - stall_since > stall_timeout:
+                proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                return PreflightItem(
+                    key="transfer", title=title, state="fail",
+                    detail=f"传输停滞超过 {stall_timeout:.0f} 秒，"
+                           f"只收到 {human_size(max(cur, 0))}",
+                    advice="USB 连接在传输中途卡死了。换一个 USB 口"
+                           "（优先主板后置口）、换一根原装线，然后重试。")
+            time.sleep(0.15)
+        _unregister_child(proc)
+        err_text = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
+        if proc.returncode != 0:
+            return PreflightItem(
+                key="transfer", title=title, state="fail",
+                detail=f"adb pull 返回 {proc.returncode}：{err_text[:160]}",
+                advice="拉取测试数据就失败了，说明这条 USB 通道撑不住备份。"
+                       "换线/换口后重试。")
+
+        got = os.path.getsize(local)
+        if got != size:
+            return PreflightItem(
+                key="transfer", title=title, state="fail",
+                detail=f"回读字节数不符：应为 {human_size(size)}，"
+                       f"实收 {human_size(got)}",
+                advice="传输中途丢了数据。换线/换口后重试。")
+
+        local_sha = sha256_file(local)
+        if local_sha != dev_sha:
+            return PreflightItem(
+                key="transfer", title=title, state="fail",
+                detail=f"两端哈希不一致：设备 {dev_sha[:12]}… / "
+                       f"本地 {local_sha[:12]}…",
+                advice="数据在传输中被破坏。换线/换口后重试，"
+                       "若反复出现请换一台电脑验证。")
+
+        secs = max(time.time() - t0, 0.001)
+        mbps = (size / secs) / 1048576.0
+        log(f"  [预检] 传输压力测试  ok  {human_size(size)}  {secs:.1f}s  "
+            f"{mbps:.1f}MB/s  两端哈希一致")
+        return PreflightItem(
+            key="transfer", title=title, state="ok",
+            detail=f"{human_size(size)} 往返一致，{secs:.1f}s，{mbps:.1f}MB/s")
+    finally:
+        # 三条路（成功/失败/取消）都要清干净设备端与本地临时文件
+        try:
+            adb.su(f"rm -f {PREFLIGHT_DEVICE_FILE}", timeout=30)
+        except Exception:                        # noqa: BLE001
+            pass
+        if local:
+            try:
+                os.remove(local)
+            except OSError:
+                pass
+
+
 class BackupEngine:
     """
     备份流程编排。
@@ -1572,6 +2164,14 @@ class BackupEngine:
         # 打包环节的结果汇总。默认「未启用」，archive_enabled 为真时才被改写。
         self.archive = ArchiveSummary()
         # ==== APB_ARCHIVE END ====
+        # 传输失联熔断：设备掉线且重连失败时被填上，run() 靠它提前收尾。
+        # 为 None 表示整轮正常跑完（不代表每个分区都成功）。
+        self.aborted: Optional[AbortInfo] = None
+        # 掉线自愈的三道闸。都刻意做成「整轮一次」，否则每个分区都重启一次
+        # adb 服务端会变成新的刷屏源，比原来的问题更难查。
+        self._blip_retried = False        # 瞬时抖动重试用掉了没
+        self._revive_attempted = False    # 重连尝试用掉了没
+        self._revive_ok = False           # 重连是否成功过
 
     # ------------------------------------------------------------------ 内部
     def _check_cancel(self):
@@ -1587,6 +2187,47 @@ class BackupEngine:
             os.makedirs(self.gpt_dir, exist_ok=True)
 
     # ------------------------------------------------------------------ 单分区
+    def _stream_with_rescue(self, name: str, part: PartitionInfo, dest: str,
+                            on_progress) -> tuple[int, float]:
+        """流式导出 + 掉线自愈。是「一条传输断了之后还要不要继续」的唯一决策点。
+
+        三层处理，从便宜到贵：
+          1. 探活通过（设备其实还在，只是抖了一下）→ 等 2 秒**原地重试一次**。
+             这一层能救回绝大多数「线松了一下」的情况，用户甚至会以为没发生过。
+          2. 探活不通过 → 走一次真正的重连（kill-server + start-server +
+             等设备回来）。整轮只做一次，记在 self._revive_attempted 上，
+             否则每个分区都重启一次服务端会变成新的刷屏源。
+          3. 重连也不成 → self.aborted 填好，抛 DeviceLost 让 run() 收尾。
+             绝不再往下试第 4 次 —— 那正是旧版本刷屏 26 行的原因。
+        """
+        blip_delay = 0.0
+        while True:
+            try:
+                return self.adb.stream_partition_to_file(
+                    name, dest, part.size, self._dd, on_progress, self.cancel,
+                    blip_retry_delay=blip_delay)
+            except DeviceLost as e:
+                reason = str(e)
+                probe_ok = bool(getattr(e, "probe_ok", False))
+
+            # 走到这里 = 这一次传输判定为掉线
+            self.log(f"  [!] 传输中断：{reason}")
+            if probe_ok and not self._blip_retried:
+                self._blip_retried = True
+                blip_delay = BLIP_RETRY_DELAY
+                self.log(f"  [i] 设备仍在，等待 {BLIP_RETRY_DELAY:.0f} 秒后重试本分区 ...")
+                continue
+
+            # 探活没过（或抖动重试也没救回来）→ 一次真正的重连尝试
+            if not self._revive_attempted:
+                self._revive_attempted = True
+                if self.adb.revive_link(self.log):
+                    self._revive_ok = True
+                    blip_delay = 0.0
+                    self.log(f"  [i] 重试 {name} ...")
+                    continue
+            raise DeviceLost(reason)
+
     def backup_partition(self, part: PartitionInfo) -> ItemResult:
         name = validate_partition_name(part.name)
         dest = os.path.join(self.img_dir, f"{name}.img")
@@ -1601,8 +2242,7 @@ class BackupEngine:
         t0 = time.time()
         try:
             try:
-                size, _ = self.adb.stream_partition_to_file(
-                    name, dest, part.size, self._dd, on_progress, self.cancel)
+                size, _ = self._stream_with_rescue(name, part, dest, on_progress)
                 res.path_mode = PATH_MODE_STREAM
             except FallbackNeeded as e:
                 if not self.opt.allow_fallback:
@@ -1655,6 +2295,14 @@ class BackupEngine:
             res.ok = True
             res.message = "OK"
         except Cancelled:
+            raise
+        except DeviceLost:
+            # ⚠️ 必须**先于** BackupError 捕获并原样抛出。
+            #    DeviceLost 是 BackupError 的子类，若被下面那个
+            #    `except BackupError` 吃掉，它就会被降级成「这一个分区失败」，
+            #    于是 run() 里的熔断永远不触发 —— 设备掉线后照样把剩下的
+            #    分区逐个刷一遍。这个坑实际发生过：假 adb 桩测试里 27 个分区
+            #    被跑了 27 次，而熔断一行都没执行。
             raise
         except BackupError as e:
             res.ok, res.message = False, str(e)
@@ -1987,7 +2635,23 @@ class BackupEngine:
         self.log(f"===== 备份 {len(partitions)} 个分区 =====")
         for p in partitions:
             self._check_cancel()
-            self.results.append(self.backup_partition(p))
+            try:
+                self.results.append(self.backup_partition(p))
+            except DeviceLost as e:
+                # 熔断：设备真的没了。剩下的分区、GPT、by-name 映射表全都
+                # 依赖同一条传输，再跑下去只会继续刷屏 —— 立刻收尾。
+                done_ok = sum(1 for x in self.results if x.ok)
+                self.aborted = AbortInfo(
+                    partition=p.name, reason=str(e), done_ok=done_ok,
+                    done_total=len(partitions),
+                    revive_tried=self._revive_attempted, revive_ok=self._revive_ok,
+                    outdir=self.outdir)
+                self.log("")
+                self.log(f"===== 已中止：{self.aborted.short} =====")
+                self.log(f"  原因：{str(e)[:200]}")
+                self.log(f"  {self.aborted.advice}")
+                self.log(f"  已完成的文件都在：{self.outdir}")
+                return self.results
 
         if self.opt.do_gpt:
             self._check_cancel()

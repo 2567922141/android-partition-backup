@@ -55,7 +55,7 @@ APP_TITLE = "安卓分区备份工具"
 #   · backup_gui.py（Tk 版）    = 1.1.1  —— 保留作为回退方案，版本号冻结
 #   · backup_gui_qt.py（本文件）= 2.0.0  —— 界面框架从 Tk 换到 Qt6 的完整重写
 # 两者功能对等、可并存，但版本号必须区分，免得用户报障时分不清跑的是哪个。
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 
 # ==============================================================================
@@ -163,8 +163,8 @@ from PySide6.QtWidgets import (       # noqa: E402
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QFileDialog,
     QFrame, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
-    QScrollArea, QSizePolicy, QStyledItemDelegate, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QStyle, QStyledItemDelegate,
+    QStyleOptionViewItem, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 # 允许脚本以任意工作目录启动 —— 与 Tk 版完全一致。
@@ -181,6 +181,8 @@ from backup_core import (          # noqa: E402
     kill_live_children,
     adb_server_running, adb_start_server, adb_stop_server,
     describe_soc, parse_sysinfo,
+    # 备份前预检：写读 16 MB 验证这条 USB 通道扛得住持续传输
+    run_preflight, PreflightReport,
 )
 from partition_profiles import (   # noqa: E402
     PRESETS, PRESET_EXCLUDE, PLATFORM_GENERIC, PROFILES_VERSION,
@@ -216,6 +218,109 @@ COLOR_OK = "#1a7f37"
 COLOR_WARN = "#b54708"
 COLOR_ERR = "#b42318"
 COLOR_DIM = "#999999"
+
+# 分区表格的行底色（tier-1 橙 / tier-2 蓝）—— 与 Tk 版最初取值一致。
+TIER1_BG = "#fff4e5"
+TIER2_BG = "#eef6ff"
+
+#: 分区表格每行配色：(背景, 前景, 说明文字)。0=不铺底色，走调色板。
+#:
+#: ⚠️ 背景与前景**必须成对设置**，这是本条记录存在的全部理由。
+#:    以前 tier-1/tier-2 只设了浅色背景、没设前景，于是文字颜色落到调色板
+#:    的 Text 上 —— 系统深色模式下 Text 是近白色，白字贴在 #fff4e5 上，
+#:    对比度只有 1.09:1（WCAG 门槛 4.5:1），整行信息看不见。
+#:    实测：backup_gui_qt.py 旧版 1867-1880 行。
+#:    tier-4 的灰字同理：浅色模式下 #999999 贴白底只有 2.85:1，也一并修掉。
+ROW_COLORS = {
+    "light": {
+        0: ("",        "",       ""),
+        1: (TIER1_BG,  "#5a3200", "仅内核相关（风险）"),
+        2: (TIER2_BG,  "#0b3d6b", "内核 + ramdisk"),
+        4: ("",        "#767676", "平台配置表（Configuration Data Table）"),
+    },
+    "dark": {
+        0: ("",        "",       ""),
+        1: ("#3a2a14", "#ffc98a", "仅内核相关（风险）"),
+        2: ("#16283d", "#9ecbff", "内核 + ramdisk"),
+        4: ("",        "#9a9a9a", "平台配置表（Configuration Data Table）"),
+    },
+}
+
+#: 选中行的底色 = 本行底色与调色板 Highlight 按此比例混合。
+#: 0.55 是「既看得出选中、又留得住行本色」的折中；两种主题下文字对比度
+#: 都远超 4.5:1（深色 7.5:1 / 浅色 8.0:1，见 _tests/test_row_contrast.py）。
+ROW_SELECT_MIX = 0.55
+
+#: 文字与底色之间至少要有的对比度（WCAG AA 正文门槛）。
+MIN_CONTRAST = 4.5
+
+#: 判定对比度是否达标时的容差。
+#: Windows 标准高亮色是 #0078d7，白字贴上去算出来是 4.4989 —— 差 0.001 才够
+#: 4.5:1。没有这个容差的话，算法会为了这 0.001 把普通行的选中文字从系统白
+#: 改成纯黑，读起来更「达标」但和整个 Windows 的观感完全不是一路。
+#: 容差只用于「放过系统配色」，真正读不清的组合（灰字贴蓝底 1.6:1）照样拦下。
+CONTRAST_TOL = 0.005
+
+
+def palette_is_dark(widget) -> bool:
+    """控件当前调色板是不是深色主题。
+
+    判据是「窗口底色偏暗还是偏亮」，不读注册表、不猜 Windows 版本 ——
+    用户换主题、或 Qt 自己给出深色调色板，这里都能跟着走。
+    """
+    return widget.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def row_colors(widget, tier: int):
+    """取某个 tier 在当前主题下的 (背景, 前景)。"""
+    table = ROW_COLORS["dark" if palette_is_dark(widget) else "light"]
+    return table.get(tier, table[0])[:2]
+
+
+def contrast_ratio(c1: str, c2: str) -> float:
+    """WCAG 相对亮度对比度（1.0 ~ 21.0）。用来挑选中态的文字色。"""
+    def _lin(v: int) -> float:
+        v /= 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+    def _lum(c: str) -> float:
+        col = QColor(c)
+        return (0.2126 * _lin(col.red()) + 0.7152 * _lin(col.green())
+                + 0.0722 * _lin(col.blue()))
+
+    a, b = _lum(c1), _lum(c2)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+
+def blend(c1: str, c2: str, t: float) -> str:
+    """把 c1 往 c2 上按比例 t 混合，返回 #rrggbb。"""
+    a, b = QColor(c1), QColor(c2)
+    return QColor(
+        int(a.red() * (1 - t) + b.red() * t),
+        int(a.green() * (1 - t) + b.green() * t),
+        int(a.blue() * (1 - t) + b.blue() * t)).name()
+
+
+def select_fg(widget, fg: str, bg: str) -> str:
+    """选中态该用什么文字色 —— bg 是选中行真正被铺上的底色。
+
+    选中行铺的是「行底色与 Highlight 混合后」的颜色，文字色不能沿用未选中
+    时那一套：深色模式下 Highlight 是亮的蓝，深灰字贴上去只有 1.6:1。
+
+    挑法按优先级，而不是一味取对比度最高的那个 —— 后者会给普通行挑出
+    「黑字贴蓝底」，虽然也过 4.5:1，但和 Windows 的观感完全不是一路：
+      ① 调色板自己的 HighlightedText（系统约定的选中文字色，最自然）
+      ② 该行未选中时的文字色（行本色能保住就保住）
+      ③ 纯白 / 纯黑（兜底，保证不会剩下一个读不清的组合）
+    只有当前面的候选达不到 MIN_CONTRAST 时才往后走。
+    """
+    hl_text = widget.palette().color(QPalette.ColorRole.HighlightedText).name()
+    for cand in (hl_text, fg, "#ffffff", "#000000"):
+        if cand and contrast_ratio(cand, bg) >= MIN_CONTRAST - CONTRAST_TOL:
+            return cand
+    return hl_text
+
+
 
 # 日志分级配色 —— 与 Tk 版 log.tag_configure 逐字一致
 LOG_COLORS = {
@@ -472,15 +577,87 @@ class FlowWidget(QFrame):
 
 
 class _RowHeightDelegate(QStyledItemDelegate):
-    """把表格行高固定成 Tk 版 Treeview 的 rowheight=24。"""
+    """把表格行高固定成 Tk 版 Treeview 的 rowheight=24，并接管行配色。
+
+    【为什么行配色要放在 delegate 里】
+    `QTreeWidgetItem.setBackground()` 设的刷子在**选中时依然生效**（Qt 只是
+    改用 HighlightedText 画字），于是选中一行 tier-1 会得到「白字 + 自带的
+    #fff4e5 底」—— 和深色模式下未选中时一样看不清。所以行底色和行文字色
+    必须由同一个人决定，那个人就是这里。实测依据见
+    _tests/test_row_contrast.py 的选中态用例。
+
+    ⚠️ 这里刻意不用 setStyleSheet（理由见 BackupApp._color 的注释：样式表会
+       给整棵子树换上 QStyleSheetStyle，重绘变慢）。本类只是多两次调色板
+       改色，绘制仍走默认路径。
+    """
 
     def __init__(self, height: int, parent=None):
         super().__init__(parent)
         self._h = height
+        # (主题, tier) -> (背景, 前景)。未登记的行一律走默认绘制。
+        self._row_tint: dict = {}
+
+    def set_row_tint(self, widget, theme: str, tier: int, bg: str, fg: str):
+        """登记某行在给定主题下的配色。由 _render_rows() 在重建表格时调用。
+
+        bg 为 "" 表示「本行不铺底色」；此时未选中态由 _render_rows 用
+        setForeground 直接设，本表只负责选中态的文字色。
+
+        选中态的底色 = 未选中底色与调色板 Highlight 的混合（没底色就纯粹是
+        Highlight）。文字色必须按**选中态那个底色**重算 —— 沿用未选中时的
+        灰色，贴到亮蓝上只有 1.6:1。
+        """
+        hl = widget.palette().color(QPalette.ColorRole.Highlight).name()
+        sel_bg = blend(bg, hl, ROW_SELECT_MIX) if bg else hl
+        self._row_tint[(theme, tier)] = (bg, fg, select_fg(widget, fg, sel_bg))
 
     def sizeHint(self, option, index):  # noqa: N802
         s = super().sizeHint(option, index)
         return QSize(s.width(), self._h)
+
+    def paint(self, painter, option, index):    # noqa: N802
+        o = QStyleOptionViewItem(option)
+        self.initStyleOption(o, index)
+
+        # 行身份存在 UserRole 上（_render_rows 写入）。没有它的单元格
+        # （表头、以及将来别处复用本 delegate）一律走默认绘制。
+        tier = index.data(Qt.ItemDataRole.UserRole)
+        if tier is None:
+            super().paint(painter, o, index)
+            return
+
+        theme = "dark" if palette_is_dark(option.widget or self.parent()) else "light"
+        selected = bool(o.state & QStyle.StateFlag.State_Selected)
+        spec = self._row_tint.get((theme, tier))
+        if spec is None:
+            super().paint(painter, o, index)
+            return
+
+        bg, fg, sel_fg = spec
+        if selected:
+            # 选中态的底色自带一份：Qt 只认 BackgroundRole，而它只在
+            # _render_rows 显式设过底色的行上才存在。
+            hl = o.palette.color(QPalette.ColorRole.Highlight)
+            if bg:
+                # 把行底色往 Highlight 上拉一把：既保住「这行是特殊分区」的
+                # 本色，也保住「这些行被选中了」的视觉反馈 —— 直接铺本色的
+                # 话，一按「全选」整张表就分不出选没选了。
+                m = ROW_SELECT_MIX
+                base = QColor(bg)
+                painter.fillRect(o.rect, QColor(
+                    int(base.red() * (1 - m) + hl.red() * m),
+                    int(base.green() * (1 - m) + hl.green() * m),
+                    int(base.blue() * (1 - m) + hl.blue() * m)))
+            else:
+                painter.fillRect(o.rect, hl)
+            # 选中态的文字色是登记时按混合后的底色算好的，不是 fg
+            o.palette.setColor(QPalette.ColorRole.Text, QColor(sel_fg))
+            o.palette.setColor(QPalette.ColorRole.HighlightedText, QColor(sel_fg))
+        elif fg:
+            # 未选中态：Text 管普通文字，HighlightedText 只是顺手保持一致
+            o.palette.setColor(QPalette.ColorRole.Text, QColor(fg))
+            o.palette.setColor(QPalette.ColorRole.HighlightedText, QColor(fg))
+        super().paint(painter, o, index)
 
 
 class _PartitionTree(QTreeWidget):
@@ -653,6 +830,17 @@ class BackupApp:
         # 以前各处零散地用 `self.worker and self.worker.is_alive()` 自己判断，
         # 结果就是 A 处拦得住、B 处拦不住。统一收到这一个字段上。
         self._task_busy = False
+        # 预检正在进行。它跑在自己的线程里（见 _preflight_worker），
+        # 主线程在结果回来之前必须挡住「再点一次开始」。
+        self._preflight_busy = False
+        # 预检通过之后要接着做的事（起备份线程 + 建目录）。
+        # 拆成两步是为了让预检期间窗口仍然能响应事件。
+        self._pending_start = None
+        # _pump() 的重入闩（见 _pump 的说明）
+        self._pumping = False
+        # 本轮是否已经因为「设备掉线」弹过窗。轮询线程与备份线程各会看到一次
+        # 掉线，不闩住的话用户会挨两下弹窗，第二下还是在他刚读完第一下之后。
+        self._drop_reported = False
         # 表格勾选框回滚期间的重入闩：回滚要调 setCheckState()，而它会再次
         # 触发 itemChanged → 又进 _on_item_changed。没有这个闩就会：
         # 弹一次窗 → 回滚 → 再弹一次窗 → 死循环。
@@ -1643,6 +1831,12 @@ class BackupApp:
     # ======================================================================
 
     def _pump(self):
+        # 重入闩。_drain_ui() 会在等待期间继续跑事件循环，而等待期间进来的
+        # "preflight" 消息可能又触发一次 _pump —— 没有这个闩，同一条消息
+        # 会被处理两次（实测：备份线程被起了 2 次）。
+        if self._pumping:
+            return
+        self._pumping = True
         try:
             while True:
                 kind, payload = self.msg_q.get_nowait()
@@ -1658,12 +1852,16 @@ class BackupApp:
                     self._on_progress(payload)
                 elif kind == "srv_changed":
                     self._refresh_server_state()
+                elif kind == "preflight":
+                    self._on_preflight(payload)
                 elif kind == "done":
                     self._on_done(payload)
         except queue.Empty:
             pass
         except Exception as e:
             self._log(f"[界面异常] {e}")
+        finally:
+            self._pumping = False
 
     def _on_devices(self, devs):
         if not devs:
@@ -1672,6 +1870,15 @@ class BackupApp:
             self.lbl_devsub.setText(
                 "请确认：USB 已连接 / 已开启 USB 调试 / 手机上已点“允许” / 屏幕已解锁")
             self.btn_start.setEnabled(False)
+            if self._task_busy:
+                # ⚠️ 备份进行中设备掉线：**绝不能**清空 self.adb / self.info /
+                #    self.partitions。工作线程跑完 run() 之后还要用 self.adb 和
+                #    self.info 去 detect_topology / write_manifest，主线程把它们
+                #    置 None 会让一次「设备掉线」变成一次「界面崩溃」。
+                #    分区表列表本身也仍然有效 —— 它描述的是这台设备，不是这条连接。
+                self.lbl_devsub.setText(
+                    "设备已断开！备份可能已中断，请看下方日志与弹窗提示")
+                return
             self.adb, self.info, self.partitions = None, None, []
             self._set_device_details(None)
             self._render_rows()
@@ -1850,6 +2057,11 @@ class BackupApp:
             return
         self._suppress_item_changed = True
         try:
+            # 重建表格前把 delegate 的行配色登记清掉：清完到重新登记完之间若
+            # 恰有一次重绘，未登记的行会回落到默认绘制，而不是拿着上一轮的
+            # 配色去画新行。
+            theme = "dark" if palette_is_dark(self.tree) else "light"
+            self.tree.itemDelegate()._row_tint.clear()
             self.tree.clear()
             self.rows.clear()
             self._item_of.clear()
@@ -1863,21 +2075,25 @@ class BackupApp:
                 # 列对齐（选/级别居中、大小右对齐，与 Tk 版 heads 的 anchor 一致）
                 for c, col in enumerate(TREE_COLUMNS):
                     item.setTextAlignment(c, col[3])
-                # 行配色：t1 橙 / t2 蓝 / t4 灰（与 Tk 版 tag_configure 一致）
-                if p.tier in (1, 2, 4):
-                    if p.tier == 1:
-                        bg = QBrush(QColor("#fff4e5"))
-                    elif p.tier == 2:
-                        bg = QBrush(QColor("#eef6ff"))
-                    else:
-                        bg = None
-                    if bg is not None:
-                        for c in range(len(TREE_COLUMNS)):
-                            item.setBackground(c, bg)
-                    if p.tier == 4:
-                        fg = QBrush(QColor(COLOR_DIM))
-                        for c in range(len(TREE_COLUMNS)):
-                            item.setForeground(c, fg)
+                # 行配色：t1 橙 / t2 蓝 / t4 灰（与 Tk 版 tag_configure 一致）。
+                # ⚠️ 背景与前景一起设 —— 只设背景的写法在深色模式下会让
+                #    tier-1/tier-2 变成白字贴浅底（对比度 1.09:1），整行看不见。
+                #    配色表与理由见本文件顶部 ROW_COLORS 的注释。
+                item.setData(0, Qt.ItemDataRole.UserRole, p.tier)
+                bg, fg = row_colors(self.tree, p.tier)
+                if bg or fg:
+                    bg_brush = QBrush(QColor(bg)) if bg else None
+                    fg_brush = QBrush(QColor(fg)) if fg else None
+                    for c in range(len(TREE_COLUMNS)):
+                        if bg_brush is not None:
+                            item.setBackground(c, bg_brush)
+                        if fg_brush is not None:
+                            item.setForeground(c, fg_brush)
+                # ⚠️ 无条件登记，即使这行没配色（bg/fg 都是空串）——
+                #    普通行（tier 0/3）也需要 delegate 在**选中时**接管文字色，
+                #    否则它们会顶着一身深灰字贴在亮蓝的 Highlight 上。
+                self.tree.itemDelegate().set_row_tint(
+                    self.tree, theme, p.tier, bg, fg)
                 self.tree.addTopLevelItem(item)
                 self.rows[p.name] = item
                 self._item_of[p.name] = p
@@ -1998,6 +2214,11 @@ class BackupApp:
     # ======================================================================
 
     def _start_backup(self):
+        if self._preflight_busy:
+            # 预检线程正在跑。按钮已经是禁用的，这里只是防御性兜底 ——
+            # 真被触发到（例如键盘快捷键）也不能让两次预检叠在一起。
+            self._status("预检正在进行，请稍候 ...")
+            return
         if not (self.adb and self.info):
             self._mb_warn(APP_TITLE, "设备未就绪")
             return
@@ -2040,13 +2261,107 @@ class BackupApp:
                 f"本工具只做只读导出，不写入设备任何分区。{warn}"):
             return
 
+        # ==== 备份前预检 ====================================================
+        # 放在「用户已确认」之后、「创建目录」之前。顺序是刻意的：
+        #   · 用户确认之后 —— 不会再问一遍多余的问题；
+        #   · 建目录之前   —— 预检没过时不会在硬盘上留下一个空备份目录。
+        self._run_preflight_then_start(total, outdir, chosen, out_root, resolved)
+
+    def _run_preflight_then_start(self, total: int, outdir: str, chosen: list,
+                                  out_root: str, resolved):
+        """起预检线程，结果回来后由 _on_preflight 接着开工。
+
+        【为什么不在这里等结果】
+        预检里的传输压力测试要写/读 16 MB，真机上 3~10 秒。早先的写法是
+        在这里用 _drain_ui() 泵消息等线程结束 —— 结果是在 _drain_ui 内部
+        就把 "preflight" 消息给处理了（_pump 被调了一次），于是
+        _on_preflight → _launch_backup 在本函数**还没返回**时就在栈上跑完了，
+        备份线程在等待循环里被启动。功能上碰巧对，但那是靠「谁先泵到消息」
+        的巧合支撑的，多起一次线程就是重复开工。
+
+        现在纯事件驱动：这里只负责起线程然后立刻返回，结果由主线程那个
+        80ms 的 QTimer（_pump）在消息到达时交给 _on_preflight。
+        等待期间按钮已禁用 + _preflight_busy 为真，用户点不动第二次。
+        """
+        self._preflight_busy = True
+        self.btn_start.setEnabled(False)
+        self._status("正在预检设备（写读 16 MB 验证传输稳定性，约 3~10 秒）...")
+        self._log("")
+        self._log("===== 备份前预检 =====", "head")
+        self._pending_start = (total, outdir, chosen, out_root, resolved)
+
+        threading.Thread(target=self._preflight_worker, name="preflight",
+                         daemon=True).start()
+
+    def _preflight_worker(self):
+        """预检线程。只通过 msg_q 与主线程通信，绝不碰任何 Qt 控件。"""
+        try:
+            rep = run_preflight(
+                self.adb, self._pending_start[1], self._pending_start[0],
+                log_cb=lambda s: self.msg_q.put(("log", s)),
+                cancel=self.cancel_evt)
+            self.msg_q.put(("preflight", rep))
+        except Exception as e:                       # noqa: BLE001
+            # 预检自己崩了不能连累备份：包成一个 fail 报告交给主线程决定
+            rep = PreflightReport()
+            rep.add("internal", "预检自身异常", "fail",
+                    f"{type(e).__name__}: {e}",
+                    "预检没能完成。你仍然可以选择继续备份。")
+            rep.verdict = rep._worst()
+            self.msg_q.put(("preflight", rep))
+
+    def _on_preflight(self, rep: PreflightReport):
+        """预检结果回到主线程 —— 这里决定「继续 / 放弃」。"""
+        self._preflight_busy = False
+        pending = self._pending_start
+        self._pending_start = None
+        if pending is None:
+            return
+
+        for it in rep.items:
+            mark = {"ok": "ok", "warn": "warn", "fail": "err"}.get(it.state, "dim")
+            self._log(f"  [{'OK' if it.state == 'ok' else '!'}] "
+                      f"{it.title}：{it.detail}", mark)
+            if it.state != "ok" and it.advice:
+                self._log(f"        → {it.advice}", "warn")
+
+        if rep.verdict == "ok":
+            # 通过就静默放行 —— 不打扰是刻意的，预检不该变成每天点一次的确认框
+            self._log(f"  {rep.summary}", "ok")
+            self._launch_backup(*pending)
+            return
+
+        # 有问题：说清楚哪一项、后果是什么，然后把决定权交回用户
+        head = ("预检发现可能影响备份的问题。\n\n"
+                if rep.verdict == "fail" else
+                "预检通过，但有需要注意的地方。\n\n")
+        tail = ("\n\n现在继续的话，备份有可能中途失败或结果不完整。\n"
+                "仍然要继续吗？")
+        if not self._mb_ask_ok(APP_TITLE, head + rep.lines + tail):
+            self._log(f"  {rep.summary} —— 已放弃本次备份", "warn")
+            self._status("预检未通过，已放弃备份（设备与文件均未改动）")
+            self._set_result("预检未通过", "Warn.TLabel")
+            self.btn_start.setEnabled(True)
+            self._update_sum()
+            return
+
+        self._log(f"  {rep.summary} —— 用户选择继续", "warn")
+        self._launch_backup(*pending)
+
+    def _launch_backup(self, total: int, outdir: str, chosen: list,
+                       out_root: str, resolved):
+        """预检放行之后的实际开工：建目录 → 写指纹 → 起线程。"""
         try:
             os.makedirs(outdir, exist_ok=False)      # ⚠️ 绝不覆盖已有目录
         except FileExistsError:
             self._mb_error(APP_TITLE, f"目录已存在，请换个名称：\n{outdir}")
+            self.btn_start.setEnabled(True)
+            self._update_sum()
             return
         except OSError as e:
             self._mb_error(APP_TITLE, f"无法创建备份目录：\n{e}")
+            self.btn_start.setEnabled(True)
+            self._update_sum()
             return
 
         # 立刻写下设备指纹 —— 这样即使本次备份中途失败，
@@ -2107,6 +2422,8 @@ class BackupApp:
         # 这里不再单独 _status()，否则会把那句提示盖掉。
         self._set_task_busy(True)
         self._set_result("")
+        # 新一轮，重新给「设备掉线」弹窗一次机会（上一轮弹过了就闩住了）
+        self._drop_reported = False
 
     def _backup_worker(self, chosen, outdir, opts: EngineOptions, out_root: str):
         """
@@ -2164,6 +2481,10 @@ class BackupApp:
 
             self.msg_q.put(("done", {"ok": True, "results": results,
                                      "outdir": outdir, "prev": prev,
+                                     # 设备中途失联导致整轮提前收尾时非 None。
+                                     # manifest / README 照写 —— 已经导出的
+                                     # 分区是可用的，只是这一轮不完整。
+                                     "aborted": eng.aborted,
                                      # ==== APB_ARCHIVE BEGIN ====
                                      # 打包结果一并交给主线程显示（跨线程只传数据）
                                      "archive": eng.archive,
@@ -2306,18 +2627,64 @@ class BackupApp:
         ok = sum(1 for x in results if x.ok)
         bad = len(results) - ok
         total = sum(x.real_size for x in results if x.ok)
-        # 设备端校验的战果 —— 让用户看得见这一层到底跑了没跑
+        abort = r.get("aborted")
+        # 设备端校验战果。只有**整轮无失败**才配称为「一致」——
+        # 见下面 dv_ok 那段的说明。
         dv_ok = sum(1 for x in results if x.device_verified is True)
         dv_no = sum(1 for x in results if x.device_verified is False)
-        if bad == 0:
-            self._set_result(f"✅ 全部通过 {ok}/{len(results)}", "Ok.TLabel")
+        complete = (bad == 0 and abort is None)
+
+        # ==== 设备中途失联 =================================================
+        # 这一条必须排在最前面，而且必须是弹窗。理由是真机实测：设备在第二个
+        # 分区掉线，整轮 9 秒就跑完了 —— 用户这时候多半已经走开，回来只看到
+        # 一屏红字。9 秒的中止逻辑如果只写在日志里，等于没写。
+        if abort is not None:
+            self._set_result(f"⚠️ 已中止 {ok}/{abort.done_total}",
+                             "Err.TLabel" if ok == 0 else "Warn.TLabel")
+            self._status(f"设备失联，备份已中止：{ok}/{abort.done_total} 完成")
+            self._log("", "warn")
+            self._log(f"[!] {abort.short}", "err")
+            self._log(f"    原因：{abort.reason}", "warn")
+            self._log(f"    {abort.advice}", "warn")
+            self._log(f"    已完成的文件都保留着：{abort.outdir}", "warn")
+            self._log("[!] 本次结果【不完整】—— 失败列表里的分区没有被备份。",
+                      "err")
+            if not self._drop_reported:
+                self._drop_reported = True
+                self._mb_error(
+                    APP_TITLE,
+                    f"{abort.short}\n\n"
+                    f"掉线分区：{abort.partition}\n"
+                    f"原因：{abort.reason[:300]}\n\n"
+                    f"{abort.advice}\n\n"
+                    f"已完成的 {ok} 个文件都在：\n{abort.outdir}\n\n"
+                    f"⚠️ 本次结果不完整，请不要把它当成一次成功的整机备份。")
+            # 注意：这里**不能 return** —— 下面还有压缩包结果要报，
+            # 而打包是在 run() 内部就做完的，return 会把已经生成的压缩包
+            # 从界面上抹掉，用户以为没打包，其实硬盘上有一个。
         else:
-            self._set_result(f"⚠️ {ok} 通过 / {bad} 失败", "Warn.TLabel")
-        self._status(f"完成：{ok}/{len(results)} 通过，共 {human_size(total)}")
-        if dv_ok:
-            self._log(f"  其中 {dv_ok} 项与设备端哈希核对一致", "ok")
-        if dv_no:
-            self._log(f"  [!] {dv_no} 项没能做设备端校验（设备端没算出哈希）", "warn")
+            # ==== 设备端校验的战果 ==========================================
+            # ⚠️ 这一行以前是「只要 dv_ok > 0 就打绿色 ok」。27 个分区里 26 个
+            #    失败时，它成了整屏最醒目的一句话，用户会以为整轮都验过了 ——
+            #    这比报错本身更危险。现在只有**全部成功**才配用绿色成功语气；
+            #    有任何失败就降级成中性说明，并明确写出「不完整」。
+            if complete:
+                self._set_result(f"✅ 全部通过 {ok}/{len(results)}", "Ok.TLabel")
+            else:
+                self._set_result(f"⚠️ {ok} 通过 / {bad} 失败", "Warn.TLabel")
+            self._status(f"完成：{ok}/{len(results)} 通过，共 {human_size(total)}")
+            if dv_ok:
+                if complete:
+                    self._log(f"  其中 {dv_ok} 项与设备端哈希核对一致", "ok")
+                else:
+                    self._log(f"  已完成的 {dv_ok} 项里有设备端哈希核对（其余 "
+                              f"{bad} 项没有备份成功）", "dim")
+            if dv_no:
+                self._log(f"  [!] {dv_no} 项没能做设备端校验（设备端没算出哈希）",
+                          "warn")
+            if not complete:
+                self._log(f"[!] 本次结果不完整：{bad} 个分区没有被备份，"
+                          f"请不要当成一次成功的整机备份。", "warn")
 
         # ==== APB_ARCHIVE BEGIN ====
         # 打包环节的结果（在 run() 最后做的；没勾选时为「未启用」）
@@ -2341,13 +2708,25 @@ class BackupApp:
         # ==== APB_ARCHIVE END ====
 
         prev = r.get("prev")
-        msg = (f"备份完成\n\n通过 {ok} / 共 {len(results)} 项\n"
-               f"总大小 {human_size(total)}")
-        if dv_ok:
-            msg += f"\n设备端校验：{dv_ok} 项哈希一致 ✅"
-        if dv_no:
-            msg += f"\n⚠️ {dv_no} 项未做设备端校验"
-        msg += f"\n\n输出目录：\n{r['outdir']}"
+        if abort is not None:
+            # 弹窗已经在上面弹过了，这里只补一个非模态的汇总，绝不写成
+            #「备份完成」——那是这台工具在最坏情况下最容易撒的谎。
+            msg = (f"⚠️ 备份已中止（设备失联）\n\n"
+                   f"已完成 {ok} / 计划 {abort.done_total} 项\n"
+                   f"已备份大小 {human_size(total)}\n"
+                   f"掉线分区：{abort.partition}\n\n"
+                   f"{abort.advice}\n\n"
+                   f"输出目录：\n{r['outdir']}")
+            if dv_ok:
+                msg += f"\n\n其中 {dv_ok} 项做过设备端哈希核对"
+        else:
+            msg = (f"备份完成\n\n通过 {ok} / 共 {len(results)} 项\n"
+                   f"总大小 {human_size(total)}")
+            if dv_ok:
+                msg += f"\n设备端校验：{dv_ok} 项哈希一致 ✅"
+            if dv_no:
+                msg += f"\n⚠️ {dv_no} 项未做设备端校验"
+            msg += f"\n\n输出目录：\n{r['outdir']}"
         # ==== APB_ARCHIVE BEGIN ====
         msg += arc_msg
         # ==== APB_ARCHIVE END ====
@@ -2356,9 +2735,13 @@ class BackupApp:
         if bad:
             failed = [x.label for x in results if not x.ok][:10]
             msg += f"\n\n失败项：\n" + "\n".join(failed)
-            self._mb_warn(APP_TITLE, msg)
-        else:
+        # 用 complete 而不是 bad 来选语气：中止时 results 里可能只有
+        # 「已成功的那几个」，bad 会是 0，于是弹出一个绿色的「备份完成」——
+        # 正是这次要修掉的误导。complete 已经把中止算作不完整。
+        if complete:
             self._mb_info(APP_TITLE, msg)
+        else:
+            self._mb_warn(APP_TITLE, msg)
 
     # ======================================================================
     #  退出
@@ -2384,6 +2767,16 @@ class BackupApp:
 
         ⚠️ 四步的顺序不能动。顺带一提，②③ 之间的分界就是「先杀子进程、
            再停服务端」，反过来写会导致服务端停不掉。
+
+        【为什么这里要分「忙碌 / 空闲」两条路】
+        旧版无论忙不忙都固定睡满 1 秒（0.35 + 0.05 + 上限 0.6 的等线程循环），
+        再加 kill_live_children 最长 1.5 秒 —— 用户点完 X 要盯着一个不动的窗口
+        好几秒，那条路径上一个字节的正事都没干（没备份时根本没有需要收尾的
+        线程）。现在：
+          · 空闲退出：不睡，立刻杀子进程 → 实测 0.0x 秒。
+          · 备份进行中：收尾确实需要时间，所以给一段可见的「正在退出…」提示，
+            让用户知道程序在干活而不是卡死。
+        不变量一点没动：①②③④ 的相对顺序、以及「先杀子进程再停服务端」的分界。
         """
         if self._closing:
             return True
@@ -2395,37 +2788,45 @@ class BackupApp:
             self.cancel_evt.set()
         self._closing = True
 
+        # 只有「确实有活要收尾」时才值得让用户多等。空闲退出必须立刻见效。
+        busy = bool(self.worker is not None and self.worker.is_alive())
+        if busy:
+            self._show_closing_notice()
+
         # ① 举旗
         self.poll_stop.set()
 
-        # ② 收尾 + 清子进程。给 0.35 秒让正常的调用自己跑完（大多数 adb
-        #    命令几十毫秒就返回了），剩下的强杀。
-        self._drain_ui(0.35)
+        # ② 收尾 + 清子进程。
+        #    空闲：不睡，直接杀 —— 没有正在跑的 adb 调用需要宽限。
+        #    忙碌：仍给 0.35 秒让正常的 adb 调用自己跑完，剩下的强杀。
+        if busy:
+            self._drain_ui(0.35)
         leaked = kill_live_children()
         if leaked:
             self._log(f"[退出] 已回收 {leaked} 个仍在运行的 adb 子进程")
 
         # ③ 停掉 adb 服务端 —— 无条件执行，不给用户选择。
+        #    这里仍然泵事件：adb kill-server 是一次真实调用，最长 20 秒，
+        #    不能再让界面在这段时间里彻底冻住。
         try:
-            ok, msg = adb_stop_server(self.adb_path)
+            ok, msg = self._stop_adb_server_pumping()
             self._log(f"[退出] 停止 ADB 服务：{'成功' if ok else '未成功'}（{msg}）")
-            self._drain_ui(0.05)
         except Exception as e:
             try:
                 self._log(f"[退出] 停止 ADB 服务失败：{e}")
             except Exception:
                 pass
 
-        # ④ 等后台线程退出。这两个都是 daemon 线程，本来就会随进程结束 ——
+        # ④ 等后台线程退出。两个都是 daemon 线程，本来就会随进程结束 ——
         #    等它们只是为了收尾干净，所以上限给得很短，别让用户点完 X 还等。
-        deadline = time.monotonic() + 0.6
-        while time.monotonic() < deadline:
-            alive = [t for t in (self.worker, getattr(self, "poll_thread", None))
-                     if t is not None and t.is_alive()]
-            if not alive:
-                break
-            if not self._drain_ui(0.05):
-                break
+        #    ⚠️ 无事可等时（最要紧的路径）连循环都不进，直接往下走。
+        if busy:
+            deadline = time.monotonic() + 0.6
+            while time.monotonic() < deadline:
+                if not (self.worker is not None and self.worker.is_alive()):
+                    break
+                if not self._drain_ui(0.05):
+                    break
 
         try:
             self._pump_timer.stop()
@@ -2435,6 +2836,58 @@ class BackupApp:
         self.window.close()
         self.app.quit()
         return True
+
+    def _show_closing_notice(self) -> Optional[QLabel]:
+        """退出期间盖一个「正在退出…」提示，返回该控件（失败就返回 None）。
+
+        ⚠️ 只在备份进行中才调用。空闲退出**不能**显示它 —— 那条路径要在几十
+           毫秒内结束，盖个提示反而像是闪了一下。
+
+        失败一律吞掉：这是个纯提示，绝不能因为它把退出流程本身搞挂。
+        """
+        try:
+            lbl = QLabel("正在退出，请稍候…", self.window)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setFont(self._f(10, bold=True))
+            lbl.setAutoFillBackground(True)
+            pal = lbl.palette()
+            pal.setColor(QPalette.ColorRole.Window, QColor(COLOR_OK))
+            pal.setColor(QPalette.ColorRole.WindowText, QColor("#ffffff"))
+            lbl.setPalette(pal)
+            lbl.setGeometry(self.window.rect())
+            lbl.show()
+            lbl.raise_()
+            QApplication.processEvents()
+            return lbl
+        except Exception:
+            return None
+
+    def _stop_adb_server_pumping(self) -> tuple[bool, str]:
+        """停 adb 服务端，但别让界面在这段时间里冻住。
+
+        adb_stop_server() 自己是一次阻塞调用（backup_core 里给的是 timeout=20）。
+        空闲时它通常几十毫秒返回，但服务端要是没响应就会顶到 20 秒 —— 那期间
+        窗口一点反应都没有，正是用户抱怨的那种「点了没反应」。
+
+        所以把它丢到一个短命线程里跑，主线程在这边继续泵事件，用
+        `self.app.quit()` 当退出信号：应用一旦开始收尾就立刻收手。
+        """
+        box: dict = {}
+
+        def _run():
+            try:
+                box["r"] = adb_stop_server(self.adb_path)
+            except Exception as e:               # noqa: BLE001 - 原样交给调用处
+                box["e"] = e
+
+        th = threading.Thread(target=_run, name="apb-stop-adb", daemon=True)
+        th.start()
+        while th.is_alive():
+            if not self._drain_ui(0.02):
+                break
+        if "e" in box:
+            raise box["e"]
+        return box.get("r", (False, "未完成"))
 
     def _drain_ui(self, seconds: float) -> bool:
         """在等待期间继续跑事件循环，避免界面假死。返回 False 表示应用已没了。
