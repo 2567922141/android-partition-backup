@@ -24,7 +24,9 @@
 
 **所有代码均在真机（Redmi K70）上验证过。其他手机请自行评估风险后再用于备份重要数据（不保证能正常使用）。**
 
-> ⚠️ **使用前请务必阅读 [`DISCLAIMER.md`](DISCLAIMER.md)** —— 写分区是变砖的唯一途径，恢复操作风险极高。
+> ⚠️ **使用前请务必阅读 [`DISCLAIMER.md`](DISCLAIMER.md)**。
+> 本工具的**备份功能全程只读**，不向设备写入任何数据；
+> 但若你日后手工执行恢复（写分区），**那是最容易把设备写坏的步骤，风险极高**。
 
 <details>
 <summary><b>English</b> (click to expand)</summary>
@@ -35,7 +37,10 @@
 
 **All code has been validated on a real device (Redmi K70). On other phones, please assess the risk yourself before using it for important data (correct operation on other phones is not guaranteed).**
 
-> ⚠️ **Please read [`DISCLAIMER.md`](DISCLAIMER.md) before use** — writing to a partition is the only way to brick a device, and restore operations carry extremely high risk.
+> ⚠️ **Please read [`DISCLAIMER.md`](DISCLAIMER.md) before use.**
+> The **backup side of this tool is strictly read-only** and never writes anything to the device;
+> but if you later perform a restore by hand (writing to a partition), **that is the single easiest
+> step to get wrong and carries extremely high risk.**
 
 </details>
 
@@ -172,7 +177,7 @@ python backup_core.py --adb <adb路径> --list        # 只列出设备分区与
 | 卡死保护 | 传输停滞 120 秒自动中止（防止 adb 挂住导致无限等待）|
 | 取消 | 随时可取消，已完成的分区文件保留 |
 
-**恢复功能不提供** —— 写分区是变砖的唯一途径。参考命令只写进每次备份生成的**备份目录**里的 `README.md`，需要时自行手工执行。
+**恢复功能不提供** —— 写分区是最常见的变砖原因。参考命令只写进每次备份生成的**备份目录**里的 `README.md`，需要时自行手工执行。
 
 本项目绝对不泄露任何个人信息。
 ---

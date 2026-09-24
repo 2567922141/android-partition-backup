@@ -97,6 +97,9 @@ foreach ($f in @("backup_gui_qt.py", "backup_gui.py", "backup_core.py", "archive
     Copy-Item (Join-Path $ToolDir $f) $appDir -Force
 }
 Copy-Item (Join-Path $ToolDir "README.md") $ScriptPkg -Force
+# ⚠️ DISCLAIMER.md 必须一起带上：README.md 顶部那条警告直接指向它，
+#    漏掉的话用户解压后照着 README 去找这个文件会找不到。（踩过一次）
+Copy-Item (Join-Path $ToolDir "DISCLAIMER.md") $ScriptPkg -Force
 
 # ADB 也一起带上，省得用户自己配
 $adbDir = Join-Path $ScriptPkg "adb"
@@ -321,7 +324,8 @@ print("UNZIP_OK|py=%s|Qt=%s|PySide=%s|app=%s|adb=%s" % (
     else { Expand-Archive -Path $zipScript -DestinationPath "$verifyDir\_s" -Force }
     foreach ($f in @("app\backup_gui_qt.py", "app\backup_gui.py", "app\backup_core.py",
                      "app\archive_pack.py", "app\\partition_profiles.py", "adb\adb.exe",
-                     "启动备份工具.bat", "使用说明.txt", "run.sh")) {
+                     "启动备份工具.bat", "使用说明.txt", "run.sh",
+                     "README.md", "DISCLAIMER.md")) {
         if (-not (Test-Path (Join-Path "$verifyDir\_s" $f))) { throw "脚本版缺少 $f" }
     }
     # run.sh 必须无 BOM 且全 LF，否则 Linux 上跑不起来

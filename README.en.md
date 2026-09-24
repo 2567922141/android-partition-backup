@@ -29,7 +29,10 @@
 
 **All code has been validated on a real device (Redmi K70). On other phones, please assess the risk yourself before using it for important data (correct operation on other phones is not guaranteed).**
 
-> ⚠️ **Please read [`DISCLAIMER.md`](DISCLAIMER.md) before use** — writing to a partition is the only way to brick a device, and restore operations carry extremely high risk.
+> ⚠️ **Please read [`DISCLAIMER.md`](DISCLAIMER.md) before use.**
+> The **backup side of this tool is strictly read-only** and never writes anything to the device;
+> but if you later perform a restore by hand (writing to a partition), **that is the single easiest
+> step to get wrong and carries extremely high risk.**
 
 ---
 
@@ -164,7 +167,7 @@ You **customise** the name in the UI (leave it blank to use the default name `Ba
 | Hang protection | A stalled transfer is aborted automatically after 120 seconds (so a hung adb cannot cause an endless wait)|
 | Cancel | Cancellable at any time; partition files already completed are kept |
 
-**No restore function is provided** — writing to a partition is the only way to brick a device. Reference commands are written only into the `README.md` generated inside each **backup directory**; run them by hand if you ever need them.
+**No restore function is provided** — writing to a partition is the most common way to brick a device. Reference commands are written only into the `README.md` generated inside each **backup directory**; run them by hand if you ever need them.
 
 This project absolutely does not leak any personal information.
 ---
