@@ -45,7 +45,7 @@
 > ⚠️ **Please read [`DISCLAIMER.md`](DISCLAIMER.md) before use.**
 > The **backup side of this tool is strictly read-only** and never writes anything to the device;
 > but if you later perform a restore by hand (writing to a partition), **that is the single easiest
-> step to get wrong and carries extremely high risk.**
+> step to get wrong and carries extremely high risk; this project does not provide that function.**
 
 </details>
 
