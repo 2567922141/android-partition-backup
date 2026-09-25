@@ -18,22 +18,27 @@
 
 ## ⚡ 关于本项目
 
-> **这是一个 100% Vibe Coding 项目**，由 **DeepSeek** 完成。
+> **这是一个 100% Vibe Coding 项目**，所有代码及代码审查均有 AI 负责，人工负责真机测试，由 **DeepSeek** 完成。
 
 ***AI 有可能犯错，仅供 vibe coding 学习用途，请勿用于工业生产以及其他重要行业中。若出现任何损失，后果自负！！！***
+
+**人工测试主要测试「便携版」。**
 
 **所有代码均在真机（Redmi K70）上验证过。其他手机请自行评估风险后再用于备份重要数据（不保证能正常使用）。**
 
 > ⚠️ **使用前请务必阅读 [`DISCLAIMER.md`](DISCLAIMER.md)**。
 > 本工具的**备份功能全程只读**，不向设备写入任何数据；
-> 但若你日后手工执行恢复（写分区），**那是最容易把设备写坏的步骤，风险极高**。
+> 但若你日后手动执行恢复（写分区），**那是最容易把设备写坏的步骤，风险极高；本项目不提供该功能**。
 
 <details>
 <summary><b>English</b> (click to expand)</summary>
 
-> **This is a 100% Vibe Coding project**, built by **DeepSeek**.
+> **This is a 100% Vibe Coding project**: all coding and code review were done by AI, while humans
+> handled real-device testing. Built by **DeepSeek**.
 
 ***AI can make mistakes. It is intended for vibe coding and learning purposes only — do not use it in industrial production or any other critical field. Any losses are your own responsibility!!!***
+
+**Manual testing focuses mainly on the "portable" build.**
 
 **All code has been validated on a real device (Redmi K70). On other phones, please assess the risk yourself before using it for important data (correct operation on other phones is not guaranteed).**
 
@@ -169,7 +174,7 @@ python backup_core.py --adb <adb路径> --list        # 只列出设备分区与
 
 | 项目 | 说明 |
 |---|---|
-| 读 / 写 | 对设备分区**只有** `dd if=<分区>` 读取，**全代码不存在任何写设备分区的路径** |
+| 读  | 对设备分区**只有** `dd if=<分区>` 读取，**全代码不存在任何写设备分区的路径** |
 | 设备端写入 | 唯一的写入是 `/sdcard/.apb_tmp` 与 `/data/local/tmp` 下的临时文件，**用完立即删除** |
 | 覆盖已有备份 | **不可能** —— 创建目录用 `exist_ok=False`，重名自动改名 |
 | 命令注入 | 分区名经过白名单正则 `^[A-Za-z0-9_.\-]{1,64}$` 校验 |
@@ -365,6 +370,7 @@ python backup_core.py --adb <adb路径> --preset critical --out <输出目录>
 
 | 控件 | 作用 |
 |---|---|
+|启动程序时|自动启动ADB服务|
 | 状态文字 | 实时显示 adb 服务端在不在跑（每 2.5 秒查一次，毫秒级端口探测） |
 | `[启动]` / `[停止]` | 手动启停 adb 服务端 |
 | 退出时自动停止 | **无条件执行**，不需要设置 —— 关窗时自动 `adb kill-server` |
@@ -410,7 +416,7 @@ Backups\
 | 失败处理 | **打包失败不算备份失败** —— 数据本身是好的，只在日志里告警 |
 | 取消 | 打包期间可以取消，半成品会被删掉，源目录不受影响 |
 
-**实测压缩效果**（真实备份，971.5 MB）：
+**实测压缩效果**（真实备份，971.5 MB，仅供参考）：
 
 | 输入 | 输出 | 压缩率 | 耗时 |
 |---|---|---|---|
@@ -478,7 +484,7 @@ Backups\
 
 ### 备份很慢
 
-实测约 **12-15 MB/s**（受 USB 与 adb 限制）。参考耗时：
+实测约 *12-15 MB/s (USB2.0)*（受 USB 与 adb 限制）。参考耗时：
 
 | 内容 | 体积 | 耗时 |
 |---|---|---|
@@ -580,7 +586,7 @@ partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 **但必须**：
 
 - 📌 保留版权声明与许可证原文
-- 🔓 **衍生作品也必须以 GPL-3.0 开源**（copyleft —— 这是 GPL 与 MIT 最大的区别）
+- 🔓 **衍生作品也必须以 GPL-3.0 开源**
 - 📝 修改过的版本需注明改动内容与日期
 
 **本软件不提供任何担保** —— 详见 [`LICENSE`](LICENSE) 第 15–17 节。
@@ -622,7 +628,7 @@ partition_profiles.py  平台特征 + 分区四级分类规则（纯数据）
 
 > 展锐 `prodnv` `nvitem` `wcnmodem` `splloader`；三星 `up_param`；Tensor `ldfw`
 
-这些规则**模式不匹配时不会误伤**，但若在你的机型上判断有误，欢迎提 Issue。
+这些规则**模式不匹配时不会误伤**，但若在你的机型上判断有误，欢迎提交Issue以及人工审查。
 
 ### 声明
 

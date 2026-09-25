@@ -23,9 +23,12 @@
 
 ## ⚡ About This Project
 
-> **This is a 100% Vibe Coding project**, built by **DeepSeek**.
+> **This is a 100% Vibe Coding project**: all coding and code review were done by AI, while humans
+> handled real-device testing. Built by **DeepSeek**.
 
 ***AI can make mistakes. It is intended for vibe coding and learning purposes only — do not use it in industrial production or any other critical field. Any losses are your own responsibility!!!***
+
+**Manual testing focuses mainly on the "portable" build.**
 
 **All code has been validated on a real device (Redmi K70). On other phones, please assess the risk yourself before using it for important data (correct operation on other phones is not guaranteed).**
 
@@ -159,7 +162,7 @@ You **customise** the name in the UI (leave it blank to use the default name `Ba
 
 | Item | Description |
 |---|---|
-| Read / write | For device partitions there is **only** the read `dd if=<partition>`; **no code path anywhere in the program writes to a device partition** |
+| Read | For device partitions there is **only** the read `dd if=<partition>`; **no code path anywhere in the program writes to a device partition** |
 | Writes on the device | The only writes are temporary files under `/sdcard/.apb_tmp` and `/data/local/tmp`, **deleted immediately after use** |
 | Overwriting existing backups | **Impossible** — directories are created with `exist_ok=False`, and name clashes are renamed automatically |
 | Command injection | Partition names are validated against the whitelist regex `^[A-Za-z0-9_.\-]{1,64}$` |
@@ -370,6 +373,7 @@ The UI has a row: **`ADB 服务: ● 运行中  [停止]  退出本程序时会�
 
 | Control | What it does |
 |---|---|
+| Launching the program | Starts the ADB server automatically |
 | Status text | Shows in real time whether the adb server is up (polled every 2.5 s via a millisecond-level port probe) |
 | `[启动]` / `[停止]` | Start or stop the adb server manually |
 | Auto-stop on exit | **Unconditional, no setting needed** — runs `adb kill-server` when you close the window |
